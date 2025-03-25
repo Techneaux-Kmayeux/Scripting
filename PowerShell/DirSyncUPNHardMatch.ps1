@@ -7,11 +7,11 @@
     - Constructs an Azure AD UPN from the on-prem UPN and the provided PrimaryDomain.
     - Converts the on-prem AD ObjectGUID to a Base64 string (ImmutableID).
     - Retrieves all Azure AD users once and builds a dictionary for fast lookups.
-    - If the standard UPN isn’t found, attempts fallback UPN patterns (using first name, initials, etc.) and verifies via name match.
+    - If the primary guess UPN isn’t found, attempts fallback UPN patterns (using first name, etc.) and verifies via name match.
     - Updates the matching Azure AD user’s OnPremisesImmutableId.
-    - Logs successes and failures to CSV.
-    - At the end, produces a report (CSV) listing Azure AD users that were NOT found in the on-prem AD list.
-    
+    - Logs successes and failures to CSV (with domain discrepancy included at the top if any).
+    - Produces a trimmed orphan report with four columns: (GivenName, OnPremImmutableId, Surname, UPN).
+
 .NOTES
     - Requires: ActiveDirectory and Microsoft Graph modules.
     - Run with an account that can install modules and authenticate to Graph.
@@ -19,20 +19,20 @@
 #>
 
 param(
-    [string]$FailureCsvPath = "C:\Techneaux\HardLinkScript\HardMatchFailures.csv",
-    [string]$SuccessCsvPath = "C:\Techneaux\HardLinkScript\HardMatchSuccessLog.csv",
-    [string]$OrphanReportCsvPath = "C:\Techneaux\HardLinkScript\AzureNotInAD.csv",
-    [int]$MaxUsers = 20,
-    [bool]$FullSend = $false,
-    [string]$PrimaryDomain = $null,
-    [string]$MSOLDomain = $null
+    [string]$FailureCsvPath       = "C:\Techneaux\HardLinkScript\HardMatchFailures.csv",
+    [string]$SuccessCsvPath       = "C:\Techneaux\HardLinkScript\HardMatchSuccessLog.csv",
+    [string]$OrphanReportCsvPath  = "C:\Techneaux\HardLinkScript\AzureNotInAD.csv",
+    [int]$MaxUsers                = 20,
+    [bool]$FullSend               = $false,
+    [string]$PrimaryDomain        = $null,
+    [string]$MSOLDomain           = $null
 )
 
 ###############################################################################
 # 1. Validate required parameters
 ###############################################################################
 if (-not $PrimaryDomain) {
-    Write-Warning "ERROR: You MUST include the Org's Primary Domain. Example: -PrimaryDomain techneaux.com"
+    Write-Host "ERROR: You MUST include the Org's Primary Domain. Example: -PrimaryDomain techneaux.com"
     exit 1
 }
 
@@ -43,7 +43,7 @@ try {
     Install-Module Microsoft.Graph -ErrorAction Ignore -Scope CurrentUser
 }
 catch {
-    Write-Warning "ERROR: Microsoft Graph Module Failed to Install. Troubleshoot manually then re-run script."
+    Write-Host "ERROR: Microsoft Graph Module Failed to Install. Troubleshoot manually then re-run script."
     exit 2
 }
 
@@ -62,7 +62,7 @@ try {
     Connect-MgGraph -Scopes "User.ReadWrite.All","Directory.ReadWrite.All"
 }
 catch {
-    Write-Warning "ERROR: Failed to Connect to MgGraph. Troubleshoot manually then re-run."
+    Write-Host "ERROR: Failed to Connect to MgGraph. Troubleshoot manually then re-run."
     exit 3
 }
 
@@ -70,20 +70,21 @@ catch {
 # 5. Verify PrimaryDomain against tenant’s default domain
 ###############################################################################
 try {
-    # Retrieve organization info; the verifiedDomains property contains the default domain.
+    # Retrieve organization info; the VerifiedDomains property contains the default domain.
     $org = Get-MgOrganization -ErrorAction Stop
     $defaultDomain = ($org.VerifiedDomains | Where-Object { $_.IsDefault -eq $true }).Name
 }
 catch {
-    Write-Warning "ERROR: Could not retrieve organization domain information."
+    Write-Host "ERROR: Could not retrieve organization domain information."
     exit 5
 }
 
+$domainDiscrepancy = ""
 if ($PrimaryDomain.ToLower() -ne $defaultDomain.ToLower()) {
     Write-Host "WARNING: The PrimaryDomain you provided ('$PrimaryDomain') does not match the tenant's default domain ('$defaultDomain')."
     $response = Read-Host "Would you like to continue? (Y/N)"
     if ($response -notin @("Y","y")) {
-        Write-Warning "User opted to exit due to domain mismatch."
+        Write-Host "User opted to exit due to domain mismatch."
         exit 6
     }
     else {
@@ -130,7 +131,7 @@ try {
     $AllAzureUsers = Get-MgUser -All -Property "GivenName","Surname","OnPremisesImmutableId","UserPrincipalName"
 }
 catch {
-    Write-Warning "ERROR: Failed to retrieve Azure AD users. Exiting."
+    Write-Host "ERROR: Failed to retrieve Azure AD users. Exiting."
     exit 4
 }
 
@@ -145,10 +146,10 @@ foreach ($u in $AllAzureUsers) {
 # 9. Prepare a collection to store output results and track processed UPNs
 ###############################################################################
 $Results = @()
-$ProcessedUPNs = @()  # will hold the converted UPNs from on-prem users
+$ProcessedUPNs = @()  # Will only store final matched UPNs
 
 ###############################################################################
-# 10. Process each on-prem AD user
+# 10. Process each On-Prem AD user
 ###############################################################################
 foreach ($user in $OnPremUsers) {
 
@@ -158,107 +159,109 @@ foreach ($user in $OnPremUsers) {
         continue
     }
     
-    # Get on-prem name details
+    # Gather on-prem name details
     $onPremFirstName = $user.GivenName
     $onPremLastName  = $user.Surname
-    $onPremMiddle    = $user.MiddleName  # (or use $user.Initials if preferred)
+    $onPremMiddle    = $user.MiddleName
+
+    # Build a primary guess for the Azure AD UPN
+    $localPart       = $user.UserPrincipalName.Split('@')[0]
+    $primaryGuessUPN = "$localPart@$PrimaryDomain"
     
-    # Construct primary Azure AD UPN from on-prem UPN (local part + provided PrimaryDomain)
-    $localPart = $user.UserPrincipalName.Split('@')[0]
-    $azureADUPN = "$localPart@$PrimaryDomain"
-    
-    # Track this converted UPN (in lowercase for consistent matching)
-    $ProcessedUPNs += $azureADUPN.ToLower()
-    
-    # Attempt lookup in our Azure AD dictionary
-    $azureUser = $AzureUsersByUPN[$azureADUPN.ToLower()]
-    
-    # If not found, try fallback patterns (only if first and last names exist)
-    if (-not $azureUser -and $onPremFirstName -and $onPremLastName) {
-        $candidateUPNs = @()
-        # Pattern 1: firstName@domain
-        $candidateUPNs += "$onPremFirstName@$PrimaryDomain"
-        # Pattern 2: firstInitial + lastName@domain
-        if ($onPremFirstName.Length -ge 1 -and $onPremLastName.Length -ge 1) {
-            $candidateUPNs += ("{0}{1}@{2}" -f $onPremFirstName.Substring(0,1), $onPremLastName, $PrimaryDomain)
-        }
-        # Pattern 3: firstInitial + middleInitial + lastName@domain (if middle exists)
-        if ($onPremMiddle -and $onPremMiddle.Length -ge 1 -and $onPremFirstName.Length -ge 1 -and $onPremLastName.Length -ge 1) {
-            $candidateUPNs += ("{0}{1}{2}@{3}" -f $onPremFirstName.Substring(0,1), $onPremMiddle.Substring(0,1), $onPremLastName, $PrimaryDomain)
-        }
-        # Pattern 4: firstName + lastNameInitial@domain
-        if ($onPremLastName.Length -ge 1) {
-            $candidateUPNs += ("{0}{1}@{2}" -f $onPremFirstName, $onPremLastName.Substring(0,1), $PrimaryDomain)
-        }
-        # Pattern 5: firstName.lastName@domain
-        $candidateUPNs += ("{0}.{1}@{2}" -f $onPremFirstName, $onPremLastName, $PrimaryDomain)
-        
-        foreach ($candidate in $candidateUPNs) {
-            Write-Verbose "Trying alternative UPN: $candidate"
-            $potentialUser = $AzureUsersByUPN[$candidate.ToLower()]
-            if ($potentialUser) {
-                # Verify name match
-                if ($potentialUser.GivenName -eq $onPremFirstName -and $potentialUser.Surname -eq $onPremLastName) {
-                    Write-Verbose "Found matching Azure AD user via alternative UPN: $candidate"
-                    $azureADUPN = $candidate
-                    $azureUser = $potentialUser
-                    break
-                }
-                else {
-                    Write-Verbose "User found via candidate UPN but name mismatch. Continuing..."
+    # Try initial lookup
+    $azureUser = $AzureUsersByUPN[$primaryGuessUPN.ToLower()]
+    $finalMatchedUPN = $null
+
+    if ($azureUser) {
+        # Found via primary guess
+        $finalMatchedUPN = $primaryGuessUPN
+    }
+    else {
+        # Attempt fallback patterns if we have a first/last name
+        if ($onPremFirstName -and $onPremLastName) {
+            $candidateUPNs = @()
+            $candidateUPNs += "$onPremFirstName@$PrimaryDomain"
+            if ($onPremFirstName.Length -ge 1 -and $onPremLastName.Length -ge 1) {
+                $candidateUPNs += ("{0}{1}@{2}" -f $onPremFirstName.Substring(0,1), $onPremLastName, $PrimaryDomain)
+            }
+            if ($onPremMiddle -and $onPremMiddle.Length -ge 1 -and $onPremFirstName.Length -ge 1 -and $onPremLastName.Length -ge 1) {
+                $candidateUPNs += ("{0}{1}{2}@{3}" -f $onPremFirstName.Substring(0,1), $onPremMiddle.Substring(0,1), $onPremLastName, $PrimaryDomain)
+            }
+            if ($onPremLastName.Length -ge 1) {
+                $candidateUPNs += ("{0}{1}@{2}" -f $onPremFirstName, $onPremLastName.Substring(0,1), $PrimaryDomain)
+            }
+            $candidateUPNs += ("{0}.{1}@{2}" -f $onPremFirstName, $onPremLastName, $PrimaryDomain)
+
+            foreach ($candidate in $candidateUPNs | Where-Object { $_ }) {
+                Write-Verbose "Trying fallback UPN: $candidate"
+                $potentialUser = $AzureUsersByUPN[$candidate.ToLower()]
+                if ($potentialUser) {
+                    # Verify name match
+                    if ($potentialUser.GivenName -eq $onPremFirstName -and $potentialUser.Surname -eq $onPremLastName) {
+                        Write-Verbose "Found matching Azure AD user via fallback UPN: $candidate"
+                        $azureUser       = $potentialUser
+                        $finalMatchedUPN = $candidate
+                        break
+                    }
                 }
             }
         }
     }
-    
-    # Convert the on-prem AD ObjectGUID to a Base64 string
-    $immutableId = [System.Convert]::ToBase64String($user.ObjectGUID.ToByteArray())
-    
-    # If no matching Azure AD user was found, record failure and continue to next user
+
+    # If still no match, log failure
     if (-not $azureUser) {
         $Results += [pscustomobject]@{
-            OnPremUser    = $user.UserPrincipalName
-            AzureADUser   = $azureADUPN
-            Status        = "FAILED"
-            Reason        = "User not found in Azure AD"
-            OnPremEnabled = $user.Enabled
-            NewID         = $immutableId
-            PreviousID    = $null
+            OnPremUser         = $user.UserPrincipalName
+            AzureADUser        = $primaryGuessUPN
+            Status             = "FAILED"
+            Reason             = "User not found in Azure AD"
+            OnPremEnabled      = $user.Enabled
+            NewID              = [System.Convert]::ToBase64String($user.ObjectGUID.ToByteArray())
+            PreviousID         = $null
+            DomainDiscrepancy  = $domainDiscrepancy
         }
-        Write-Warning "FAILED: $($user.UserPrincipalName) => $azureADUPN : User not found in Azure AD"
+        Write-Warning "FAILED: $($user.UserPrincipalName) => $primaryGuessUPN : No match in Azure AD"
         continue
     }
     
-    # Retrieve previous OnPremisesImmutableId from the found Azure user
-    $PriorId = $azureUser.OnPremisesImmutableId
-    
-    # Attempt to update the Azure AD user with the new OnPremisesImmutableId
+    # We have a match: add the final UPN to $ProcessedUPNs
+    $ProcessedUPNs += $finalMatchedUPN.ToLower()
+
+    # Convert the on-prem AD ObjectGUID to a Base64 string
+    $immutableId = [System.Convert]::ToBase64String($user.ObjectGUID.ToByteArray())
+
+    # Retrieve previous OnPremisesImmutableId
+    $priorId = $azureUser.OnPremisesImmutableId
+
+    # Attempt to update
     try {
-        Update-MgUser -UserId $azureADUPN -OnPremisesImmutableId $immutableId -ErrorAction Stop
-        
+        Update-MgUser -UserId $finalMatchedUPN -OnPremisesImmutableId $immutableId -ErrorAction Stop
+
         $Results += [pscustomobject]@{
-            OnPremUser    = $user.UserPrincipalName
-            AzureADUser   = $azureADUPN
-            Status        = "SUCCESS"
-            Reason        = ""
-            OnPremEnabled = $user.Enabled
-            NewID         = $immutableId
-            PreviousID    = $PriorId
+            OnPremUser         = $user.UserPrincipalName
+            AzureADUser        = $finalMatchedUPN
+            Status             = "SUCCESS"
+            Reason             = ""
+            OnPremEnabled      = $user.Enabled
+            NewID              = $immutableId
+            PreviousID         = $priorId
+            DomainDiscrepancy  = $domainDiscrepancy
         }
         
-        Write-Host "SUCCESS: Set OnPremisesImmutableId for $($user.UserPrincipalName) => $azureADUPN"
+        Write-Host "SUCCESS: Set OnPremisesImmutableId for $($user.UserPrincipalName) => $finalMatchedUPN"
     }
     catch {
         $Results += [pscustomobject]@{
-            OnPremUser    = $user.UserPrincipalName
-            AzureADUser   = $azureADUPN
-            Status        = "FAILED"
-            Reason        = $_.Exception.Message
-            OnPremEnabled = $user.Enabled
-            NewID         = $immutableId
-            PreviousID    = $PriorId
+            OnPremUser         = $user.UserPrincipalName
+            AzureADUser        = $finalMatchedUPN
+            Status             = "FAILED"
+            Reason             = $_.Exception.Message
+            OnPremEnabled      = $user.Enabled
+            NewID              = $immutableId
+            PreviousID         = $priorId
+            DomainDiscrepancy  = $domainDiscrepancy
         }
-        Write-Warning "FAILED: $($user.UserPrincipalName) => $azureADUPN : $($_.Exception.Message)"
+        Write-Warning "FAILED: $($user.UserPrincipalName) => $finalMatchedUPN : $($_.Exception.Message)"
     }
 }
 
@@ -268,13 +271,37 @@ foreach ($user in $OnPremUsers) {
 $OrphanedAzureUsers = @()
 foreach ($key in $AzureUsersByUPN.Keys) {
     if (-not ($ProcessedUPNs -contains $key)) {
+        # This user was never matched
         $OrphanedAzureUsers += $AzureUsersByUPN[$key]
     }
 }
 
 if ($OrphanedAzureUsers.Count -gt 0) {
     Write-Host "`nFound $($OrphanedAzureUsers.Count) Azure AD user(s) that were NOT present in on-prem AD."
-    $OrphanedAzureUsers | Export-Csv -Path $OrphanReportCsvPath -NoTypeInformation
+    
+    # Prepend domain discrepancy if any
+    if ($domainDiscrepancy) {
+        "DomainDiscrepancy: $domainDiscrepancy" | Out-File $OrphanReportCsvPath
+        # Then export the orphans with the 4 columns you specified
+        $OrphanedAzureUsers |
+            Select-Object `
+                GivenName,
+                @{Name="OnPremImmutableId"; Expression = { $_.OnPremisesImmutableId }},
+                Surname,
+                @{Name="UPN"; Expression = { $_.UserPrincipalName }} |
+            Export-Csv -Path $OrphanReportCsvPath -NoTypeInformation -Append
+    }
+    else {
+        # No discrepancy – just export
+        $OrphanedAzureUsers |
+            Select-Object `
+                GivenName,
+                @{Name="OnPremImmutableId"; Expression = { $_.OnPremisesImmutableId }},
+                Surname,
+                @{Name="UPN"; Expression = { $_.UserPrincipalName }} |
+            Export-Csv -Path $OrphanReportCsvPath -NoTypeInformation
+    }
+    
     Write-Host "A CSV report of these users has been saved to: $OrphanReportCsvPath"
 }
 else {
@@ -287,14 +314,26 @@ else {
 Write-Host "`n--- Summary of Hard Matching Operations ---"
 $Results | Format-Table -AutoSize
 
-# Export all operations to CSV
-$Results | Export-Csv -Path $SuccessCsvPath -NoTypeInformation
+# Export all operations (SuccessCsvPath)
+if ($domainDiscrepancy) {
+    "DomainDiscrepancy: $domainDiscrepancy" | Out-File $SuccessCsvPath
+    $Results | Export-Csv -Path $SuccessCsvPath -NoTypeInformation -Append
+}
+else {
+    $Results | Export-Csv -Path $SuccessCsvPath -NoTypeInformation
+}
 Write-Host "`nA CSV of all operations was saved to: $SuccessCsvPath"
 
-# Export failures, if any exist
+# Export failures, if any (FailureCsvPath)
 $Failures = $Results | Where-Object { $_.Status -eq "FAILED" }
 if ($Failures) {
-    $Failures | Export-Csv -Path $FailureCsvPath -NoTypeInformation
+    if ($domainDiscrepancy) {
+        "DomainDiscrepancy: $domainDiscrepancy" | Out-File $FailureCsvPath
+        $Failures | Export-Csv -Path $FailureCsvPath -NoTypeInformation -Append
+    }
+    else {
+        $Failures | Export-Csv -Path $FailureCsvPath -NoTypeInformation
+    }
     Write-Host "`nA CSV of all failures was saved to: $FailureCsvPath"
 }
 else {
@@ -302,6 +341,6 @@ else {
 }
 
 ###############################################################################
-# 13. Disconnect from Microsoft Graph (suppress output)
+# 13. Disconnect from Microsoft Graph
 ###############################################################################
 Disconnect-MgGraph | Out-Null
