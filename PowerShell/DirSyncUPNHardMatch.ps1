@@ -14,7 +14,7 @@
       next to this script).
       We never modify or guess the LAST name from synonyms.
     - Logs successes and failures to CSV, prepending domain discrepancy once if needed.
-    - Produces a trimmed orphan report with (GivenName, OnPremImmutableId, Surname, UPN).
+    - Produces a trimmed orphan report with (GivenName, OnPremisesImmutableId, Surname, UPN).
 
 .NOTES
     - Requires: ActiveDirectory and Microsoft Graph modules.
@@ -273,22 +273,35 @@ foreach ($user in $OnPremUsers) {
         }
 
         # 4) If still no match and -UseNicknames is true, attempt synonyms for FIRST NAME only
-        if (-not $finalMatchedUPN -and $UseNicknames) {
+        #    BUT only if we have a valid first/last name
+        if (-not $finalMatchedUPN -and $UseNicknames `
+            -and (-not [string]::IsNullOrWhiteSpace($onPremFirstName)) `
+            -and (-not [string]::IsNullOrWhiteSpace($onPremLastName))) {
+
             $firstNameLower = $onPremFirstName.ToLower()
             if ($NameSynonyms.ContainsKey($firstNameLower)) {
                 $synonyms = $NameSynonyms[$firstNameLower]  # a list of other possible first-name forms
                 foreach ($synonym in $synonyms) {
-                    # Build fallback patterns for $synonym + original last name
-                    $candidateUPNs = @(
-                        "$synonym@$PrimaryDomain"
-                        ("{0}{1}@{2}" -f $synonym.Substring(0,1), $onPremLastName, $PrimaryDomain)
-                        ("{0}.{1}@{2}" -f $synonym, $onPremLastName, $PrimaryDomain)
-                    )
-                    # If there's a middle initial, optionally do that too
-                    if ($onPremMiddle -and $onPremMiddle.Length -ge 1) {
-                        $candidateUPNs += ("{0}{1}{2}@{3}" -f $synonym.Substring(0,1), $onPremMiddle.Substring(0,1), $onPremLastName, $PrimaryDomain)
+                    $candidateUPNs = @()
+
+                    # Build fallback patterns for $synonym + original last name, 
+                    # but only if last name has length
+                    $candidateUPNs += "$synonym@$PrimaryDomain"
+
+                    if ($onPremLastName.Length -ge 1) {
+                        # synonymInitial + lastName
+                        if ($synonym.Length -ge 1) {
+                            $candidateUPNs += ("{0}{1}@{2}" -f $synonym.Substring(0,1), $onPremLastName, $PrimaryDomain)
+                        }
+                        # synonym + lastNameInitial
+                        $candidateUPNs += ("{0}{1}@{2}" -f $synonym, $onPremLastName.Substring(0,1), $PrimaryDomain)
+                        # synonym.middleInitial.lastName?
+                        if ($onPremMiddle -and $onPremMiddle.Length -ge 1 -and $synonym.Length -ge 1) {
+                            $candidateUPNs += ("{0}{1}{2}@{3}" -f $synonym.Substring(0,1), $onPremMiddle.Substring(0,1), $onPremLastName, $PrimaryDomain)
+                        }
+                        # synonym.lastName
+                        $candidateUPNs += ("{0}.{1}@{2}" -f $synonym, $onPremLastName, $PrimaryDomain)
                     }
-                    $candidateUPNs += ("{0}{1}@{2}" -f $synonym, $onPremLastName.Substring(0,1), $PrimaryDomain)
 
                     foreach ($candidate in $candidateUPNs | Where-Object { $_ }) {
                         Write-Verbose "Trying nickname-based UPN: $candidate"
