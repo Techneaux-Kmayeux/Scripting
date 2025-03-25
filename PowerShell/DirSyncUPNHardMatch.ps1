@@ -1,18 +1,19 @@
 <#
 .SYNOPSIS
     Performs a hard match for each user in On-Prem AD to Azure AD by setting the OnPremisesImmutableId using Microsoft Graph.
-    Includes an optional dictionary of name synonyms (nickname <-> formal name) for fallback matching.
+    Supports optional name synonym (hypocorism) lookups for FIRST NAMES ONLY via an external file.
 
 .DESCRIPTION
     - Retrieves on-premises AD users (Get-ADUser).
     - Constructs an Azure AD UPN from the on-prem UPN and the provided PrimaryDomain.
     - Converts the on-prem AD ObjectGUID to a Base64 string (ImmutableID).
     - Retrieves all Azure AD users once and builds a dictionary for fast lookups.
-    - If the standard UPN isn’t found, attempts fallback patterns (FirstName@domain, FInitial+LastName@domain, etc.).
-    - If still no match, checks a small dictionary of synonyms (e.g., Mike => Michael) and tries fallback patterns again.
-    - Updates the matching Azure AD user’s OnPremisesImmutableId.
-    - Logs successes and failures to CSV.
-    - Produces a trimmed orphan report with: GivenName, OnPremImmutableId, Surname, UPN.
+    - If the standard matching (primary guess + fallback patterns) fails,
+      and if -UseNicknames is specified, attempts to map the on-prem FIRST NAME
+      to a set of synonyms from the provided file (ex: "Mike" => "Michael", "Mitchell", etc.).
+      We never modify or guess the LAST name from synonyms.
+    - Logs successes and failures to CSV, prepending domain discrepancy once if needed.
+    - Produces a trimmed orphan report with (GivenName, OnPremImmutableId, Surname, UPN).
 
 .NOTES
     - Requires: ActiveDirectory and Microsoft Graph modules.
@@ -24,28 +25,17 @@ param(
     [string]$FailureCsvPath       = "C:\Techneaux\HardLinkScript\HardMatchFailures.csv",
     [string]$SuccessCsvPath       = "C:\Techneaux\HardLinkScript\HardMatchSuccessLog.csv",
     [string]$OrphanReportCsvPath  = "C:\Techneaux\HardLinkScript\AzureNotInAD.csv",
+
     [int]$MaxUsers                = 20,
     [bool]$FullSend               = $false,
-    [string]$PrimaryDomain        = $null,
-    [string]$MSOLDomain           = $null
-)
 
-###############################################################################
-# 0. Define a dictionary for name synonyms/nicknames (two-way where sensible)
-###############################################################################
-# You can expand this list as needed for your environment
-$NameSynonyms = @{
-    "mike"     = "michael"
-    "michael"  = "mike"
-    "william"  = "bill"
-    "bill"     = "william"
-    "richard"  = "dick"
-    "dick"     = "richard"
-    "bob"      = "robert"
-    "robert"   = "bob"
-    "billy"    = "william"
-    # etc... 
-}
+    [string]$PrimaryDomain        = $null,
+    [string]$MSOLDomain           = $null,
+
+    # New parameters for nickname/hypocorism logic
+    [bool]$UseNicknames           = $false,
+    [string]$NicknameFile         = $null
+)
 
 ###############################################################################
 # 1. Validate required parameters
@@ -116,7 +106,46 @@ else {
 }
 
 ###############################################################################
-# 6. Ensure directories for CSV files exist
+# 6. Now that initial checks are done, optionally load Nickname File
+###############################################################################
+$NameSynonyms = @{}  # dictionary for first-name synonyms
+
+if ($UseNicknames) {
+    if ($NicknameFile -and (Test-Path $NicknameFile)) {
+        Write-Host "Using nicknames from file: $NicknameFile"
+
+        $lines = Get-Content -Path $NicknameFile
+        foreach ($line in $lines) {
+            # Ignore empty lines or lines that are pure whitespace
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+            # Split line by whitespace => array of names
+            $rawNames = $line -split '\s+' | Where-Object { $_ -ne "" }
+
+            # If somehow empty after split, skip
+            if (-not $rawNames) { continue }
+
+            # For each name in that line, map it to all the others
+            foreach ($oneName in $rawNames) {
+                $lowerName = $oneName.ToLower()
+                if (-not $NameSynonyms.ContainsKey($lowerName)) {
+                    $NameSynonyms[$lowerName] = New-Object System.Collections.Generic.List[string]
+                }
+                foreach ($other in $rawNames) {
+                    if ($other -ne $oneName) {
+                        $NameSynonyms[$lowerName].Add($other)
+                    }
+                }
+            }
+        }
+    }
+    else {
+        Write-Host "WARNING: -UseNicknames was specified but NicknameFile not provided or doesn't exist. Nickname logic will be skipped."
+    }
+}
+
+###############################################################################
+# 7. Ensure directories for CSV files exist
 ###############################################################################
 $successDirectory = [System.IO.Path]::GetDirectoryName($SuccessCsvPath)
 $failureDirectory = [System.IO.Path]::GetDirectoryName($FailureCsvPath)
@@ -130,7 +159,7 @@ foreach ($dir in @($successDirectory, $failureDirectory, $orphanDirectory)) {
 }
 
 ###############################################################################
-# 7. Retrieve On-Prem AD users
+# 8. Retrieve On-Prem AD users
 ###############################################################################
 if ($FullSend) {
     Write-Host "FULL SEND: Retrieving ALL On-Prem AD users..."
@@ -143,7 +172,7 @@ else {
 }
 
 ###############################################################################
-# 8. Retrieve all Azure AD users once and build a dictionary for fast lookup
+# 9. Retrieve all Azure AD users once and build a dictionary for fast lookup
 ###############################################################################
 Write-Host "Retrieving all Azure AD users..."
 try {
@@ -162,13 +191,13 @@ foreach ($u in $AllAzureUsers) {
 }
 
 ###############################################################################
-# 9. Prepare a collection to store output results and track processed UPNs
+# 10. Prepare a collection to store output results and track processed UPNs
 ###############################################################################
 $Results       = @()
-$ProcessedUPNs = @()  # Only add final matched UPN here
+$ProcessedUPNs = @()
 
 ###############################################################################
-# 10. Process each On-Prem AD user
+# 11. Process each On-Prem AD user
 ###############################################################################
 foreach ($user in $OnPremUsers) {
 
@@ -183,7 +212,7 @@ foreach ($user in $OnPremUsers) {
     $onPremLastName  = $user.Surname
     $onPremMiddle    = $user.MiddleName
 
-    # If AD is missing given/surname, optionally parse SamAccountName if it has a space
+    # Optional parse SamAccountName if needed (lack of given/surname)
     if ((-not $onPremFirstName -or -not $onPremLastName) -and $user.SamAccountName -and $user.SamAccountName.Contains(" ")) {
         $parts = $user.SamAccountName.Split(" ", 2)
         if ($parts.Count -eq 2) {
@@ -197,37 +226,40 @@ foreach ($user in $OnPremUsers) {
     $localPart       = $user.UserPrincipalName.Split('@')[0]
     $primaryGuessUPN = "$localPart@$PrimaryDomain"
 
-    # 2) Try to match the primary guess
-    $azureUser = $AzureUsersByUPN[$primaryGuessUPN.ToLower()]
+    $azureUser       = $AzureUsersByUPN[$primaryGuessUPN.ToLower()]
     $finalMatchedUPN = $null
 
+    # 2) If the primary guess is found, great
     if ($azureUser) {
         $finalMatchedUPN = $primaryGuessUPN
     }
     else {
         # 3) Fallback patterns if we have some first/last
         if ($onPremFirstName -and $onPremLastName) {
-            # Build fallback UPNs
             $candidateUPNs = @()
+            # firstName@domain
             $candidateUPNs += "$onPremFirstName@$PrimaryDomain"
 
+            # firstInitial + lastName
             if ($onPremFirstName.Length -ge 1 -and $onPremLastName.Length -ge 1) {
                 $candidateUPNs += ("{0}{1}@{2}" -f $onPremFirstName.Substring(0,1), $onPremLastName, $PrimaryDomain)
             }
+            # firstInitial + middleInitial + lastName
             if ($onPremMiddle -and $onPremMiddle.Length -ge 1) {
                 $candidateUPNs += ("{0}{1}{2}@{3}" -f $onPremFirstName.Substring(0,1), $onPremMiddle.Substring(0,1), $onPremLastName, $PrimaryDomain)
             }
+            # firstName + lastNameInitial
             if ($onPremLastName.Length -ge 1) {
                 $candidateUPNs += ("{0}{1}@{2}" -f $onPremFirstName, $onPremLastName.Substring(0,1), $PrimaryDomain)
             }
+            # firstName.lastName
             $candidateUPNs += ("{0}.{1}@{2}" -f $onPremFirstName, $onPremLastName, $PrimaryDomain)
 
-            # Try each candidate
             foreach ($candidate in $candidateUPNs | Where-Object { $_ }) {
                 Write-Verbose "Trying fallback UPN: $candidate"
                 $potentialUser = $AzureUsersByUPN[$candidate.ToLower()]
                 if ($potentialUser) {
-                    # Verify name match to avoid collisions
+                    # Check name match to avoid collisions
                     if ($potentialUser.GivenName -eq $onPremFirstName -and $potentialUser.Surname -eq $onPremLastName) {
                         $azureUser       = $potentialUser
                         $finalMatchedUPN = $candidate
@@ -235,42 +267,49 @@ foreach ($user in $OnPremUsers) {
                     }
                 }
             }
+        }
 
-            # 4) If still no match, try name synonyms (like Mike => Michael)
-            if (-not $finalMatchedUPN) {
-                $firstNameLower = $onPremFirstName.ToLower()
-                if ($NameSynonyms.ContainsKey($firstNameLower)) {
-                    $synonym = $NameSynonyms[$firstNameLower]
-                    Write-Verbose "Trying name synonym: $onPremFirstName => $synonym"
-                    
+        # 4) If still no match and -UseNicknames is true, attempt synonyms for FIRST NAME only
+        if (-not $finalMatchedUPN -and $UseNicknames) {
+            $firstNameLower = $onPremFirstName.ToLower()
+            if ($NameSynonyms.ContainsKey($firstNameLower)) {
+                $synonyms = $NameSynonyms[$firstNameLower]  # a list of other possible first-name forms
+                foreach ($synonym in $synonyms) {
+                    # Build fallback patterns for $synonym + original last name
                     $candidateUPNs = @(
                         "$synonym@$PrimaryDomain"
                         ("{0}{1}@{2}" -f $synonym.Substring(0,1), $onPremLastName, $PrimaryDomain)
                         ("{0}.{1}@{2}" -f $synonym, $onPremLastName, $PrimaryDomain)
                     )
+                    # If there's a middle initial, you can optionally attempt that too, if you want
+                    if ($onPremMiddle -and $onPremMiddle.Length -ge 1) {
+                        $candidateUPNs += ("{0}{1}{2}@{3}" -f $synonym.Substring(0,1), $onPremMiddle.Substring(0,1), $onPremLastName, $PrimaryDomain)
+                    }
+                    $candidateUPNs += ("{0}{1}@{2}" -f $synonym, $onPremLastName.Substring(0,1), $PrimaryDomain)
 
                     foreach ($candidate in $candidateUPNs | Where-Object { $_ }) {
-                        Write-Verbose "Trying synonym-based UPN: $candidate"
+                        Write-Verbose "Trying nickname-based UPN: $candidate"
                         $potentialUser = $AzureUsersByUPN[$candidate.ToLower()]
                         if ($potentialUser) {
-                            # We also might do a minimal name check here
-                            # It's possible the Azure user might store 'Michael' in GivenName 
-                            # and the on-prem is 'Mike' or vice versa. We'll skip the name check 
-                            # or just check last name for safety:
+                            # We'll do a minimal check that $potentialUser.Surname == $onPremLastName
+                            # because we do NOT change the last name from synonyms.
                             if ($potentialUser.Surname -eq $onPremLastName) {
-                                Write-Verbose "Matched via synonym-based fallback: $candidate"
+                                Write-Verbose "Matched via nickname-based fallback: $candidate"
                                 $azureUser       = $potentialUser
                                 $finalMatchedUPN = $candidate
                                 break
                             }
                         }
                     }
+
+                    # If we found a match, break out
+                    if ($finalMatchedUPN) { break }
                 }
             }
         }
     }
 
-    # 5) If still no match, log a failure
+    # 5) If still no match, record failure
     if (-not $azureUser) {
         $Results += [pscustomobject]@{
             OnPremUser         = $user.UserPrincipalName
@@ -328,7 +367,7 @@ foreach ($user in $OnPremUsers) {
 }
 
 ###############################################################################
-# 11. Cross-reference: Identify Azure users not present in on-prem AD
+# 12. Cross-reference: Identify Azure users not present in on-prem AD
 ###############################################################################
 $OrphanedAzureUsers = @()
 foreach ($key in $AzureUsersByUPN.Keys) {
@@ -341,7 +380,6 @@ foreach ($key in $AzureUsersByUPN.Keys) {
 if ($OrphanedAzureUsers.Count -gt 0) {
     Write-Host "`nFound $($OrphanedAzureUsers.Count) Azure AD user(s) that were NOT present in on-prem AD."
     
-    # Prepend domain discrepancy if any
     if ($domainDiscrepancy) {
         "DomainDiscrepancy: $domainDiscrepancy" | Out-File $OrphanReportCsvPath
         $OrphanedAzureUsers |
@@ -369,12 +407,11 @@ else {
 }
 
 ###############################################################################
-# 12. Output and export final results
+# 13. Output and export final results
 ###############################################################################
 Write-Host "`n--- Summary of Hard Matching Operations ---"
 $Results | Format-Table -AutoSize
 
-# Export all operations (SuccessCsvPath)
 if ($domainDiscrepancy) {
     "DomainDiscrepancy: $domainDiscrepancy" | Out-File $SuccessCsvPath
     $Results | Export-Csv -Path $SuccessCsvPath -NoTypeInformation -Append
@@ -384,7 +421,6 @@ else {
 }
 Write-Host "`nA CSV of all operations was saved to: $SuccessCsvPath"
 
-# Export failures, if any (FailureCsvPath)
 $Failures = $Results | Where-Object { $_.Status -eq "FAILED" }
 if ($Failures) {
     if ($domainDiscrepancy) {
@@ -401,6 +437,6 @@ else {
 }
 
 ###############################################################################
-# 13. Disconnect from Microsoft Graph
+# 14. Disconnect from Microsoft Graph
 ###############################################################################
 Disconnect-MgGraph | Out-Null
