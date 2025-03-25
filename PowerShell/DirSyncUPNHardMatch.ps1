@@ -1,16 +1,18 @@
 <#
 .SYNOPSIS
     Performs a hard match for each user in On-Prem AD to Azure AD by setting the OnPremisesImmutableId using Microsoft Graph.
+    Includes an optional dictionary of name synonyms (nickname <-> formal name) for fallback matching.
 
 .DESCRIPTION
     - Retrieves on-premises AD users (Get-ADUser).
     - Constructs an Azure AD UPN from the on-prem UPN and the provided PrimaryDomain.
     - Converts the on-prem AD ObjectGUID to a Base64 string (ImmutableID).
     - Retrieves all Azure AD users once and builds a dictionary for fast lookups.
-    - If the primary guess UPN isn’t found, attempts fallback UPN patterns (using first name, etc.) and verifies via name match.
+    - If the standard UPN isn’t found, attempts fallback patterns (FirstName@domain, FInitial+LastName@domain, etc.).
+    - If still no match, checks a small dictionary of synonyms (e.g., Mike => Michael) and tries fallback patterns again.
     - Updates the matching Azure AD user’s OnPremisesImmutableId.
-    - Logs successes and failures to CSV (with domain discrepancy included at the top if any).
-    - Produces a trimmed orphan report with four columns: (GivenName, OnPremImmutableId, Surname, UPN).
+    - Logs successes and failures to CSV.
+    - Produces a trimmed orphan report with: GivenName, OnPremImmutableId, Surname, UPN.
 
 .NOTES
     - Requires: ActiveDirectory and Microsoft Graph modules.
@@ -27,6 +29,23 @@ param(
     [string]$PrimaryDomain        = $null,
     [string]$MSOLDomain           = $null
 )
+
+###############################################################################
+# 0. Define a dictionary for name synonyms/nicknames (two-way where sensible)
+###############################################################################
+# You can expand this list as needed for your environment
+$NameSynonyms = @{
+    "mike"     = "michael"
+    "michael"  = "mike"
+    "william"  = "bill"
+    "bill"     = "william"
+    "richard"  = "dick"
+    "dick"     = "richard"
+    "bob"      = "robert"
+    "robert"   = "bob"
+    "billy"    = "william"
+    # etc... 
+}
 
 ###############################################################################
 # 1. Validate required parameters
@@ -145,8 +164,8 @@ foreach ($u in $AllAzureUsers) {
 ###############################################################################
 # 9. Prepare a collection to store output results and track processed UPNs
 ###############################################################################
-$Results = @()
-$ProcessedUPNs = @()  # Will only store final matched UPNs
+$Results       = @()
+$ProcessedUPNs = @()  # Only add final matched UPN here
 
 ###############################################################################
 # 10. Process each On-Prem AD user
@@ -158,33 +177,44 @@ foreach ($user in $OnPremUsers) {
         Write-Warning "Skipping user $($user.SamAccountName) - no UPN found."
         continue
     }
-    
+
     # Gather on-prem name details
     $onPremFirstName = $user.GivenName
     $onPremLastName  = $user.Surname
     $onPremMiddle    = $user.MiddleName
 
-    # Build a primary guess for the Azure AD UPN
+    # If AD is missing given/surname, optionally parse SamAccountName if it has a space
+    if ((-not $onPremFirstName -or -not $onPremLastName) -and $user.SamAccountName -and $user.SamAccountName.Contains(" ")) {
+        $parts = $user.SamAccountName.Split(" ", 2)
+        if ($parts.Count -eq 2) {
+            $onPremFirstName = $parts[0]
+            $onPremLastName  = $parts[1]
+            Write-Verbose "Parsed SamAccountName '$($user.SamAccountName)' => '$onPremFirstName' + '$onPremLastName'"
+        }
+    }
+
+    # 1) Build a primary guess for Azure AD UPN
     $localPart       = $user.UserPrincipalName.Split('@')[0]
     $primaryGuessUPN = "$localPart@$PrimaryDomain"
-    
-    # Try initial lookup
+
+    # 2) Try to match the primary guess
     $azureUser = $AzureUsersByUPN[$primaryGuessUPN.ToLower()]
     $finalMatchedUPN = $null
 
     if ($azureUser) {
-        # Found via primary guess
         $finalMatchedUPN = $primaryGuessUPN
     }
     else {
-        # Attempt fallback patterns if we have a first/last name
+        # 3) Fallback patterns if we have some first/last
         if ($onPremFirstName -and $onPremLastName) {
+            # Build fallback UPNs
             $candidateUPNs = @()
             $candidateUPNs += "$onPremFirstName@$PrimaryDomain"
+
             if ($onPremFirstName.Length -ge 1 -and $onPremLastName.Length -ge 1) {
                 $candidateUPNs += ("{0}{1}@{2}" -f $onPremFirstName.Substring(0,1), $onPremLastName, $PrimaryDomain)
             }
-            if ($onPremMiddle -and $onPremMiddle.Length -ge 1 -and $onPremFirstName.Length -ge 1 -and $onPremLastName.Length -ge 1) {
+            if ($onPremMiddle -and $onPremMiddle.Length -ge 1) {
                 $candidateUPNs += ("{0}{1}{2}@{3}" -f $onPremFirstName.Substring(0,1), $onPremMiddle.Substring(0,1), $onPremLastName, $PrimaryDomain)
             }
             if ($onPremLastName.Length -ge 1) {
@@ -192,23 +222,55 @@ foreach ($user in $OnPremUsers) {
             }
             $candidateUPNs += ("{0}.{1}@{2}" -f $onPremFirstName, $onPremLastName, $PrimaryDomain)
 
+            # Try each candidate
             foreach ($candidate in $candidateUPNs | Where-Object { $_ }) {
                 Write-Verbose "Trying fallback UPN: $candidate"
                 $potentialUser = $AzureUsersByUPN[$candidate.ToLower()]
                 if ($potentialUser) {
-                    # Verify name match
+                    # Verify name match to avoid collisions
                     if ($potentialUser.GivenName -eq $onPremFirstName -and $potentialUser.Surname -eq $onPremLastName) {
-                        Write-Verbose "Found matching Azure AD user via fallback UPN: $candidate"
                         $azureUser       = $potentialUser
                         $finalMatchedUPN = $candidate
                         break
                     }
                 }
             }
+
+            # 4) If still no match, try name synonyms (like Mike => Michael)
+            if (-not $finalMatchedUPN) {
+                $firstNameLower = $onPremFirstName.ToLower()
+                if ($NameSynonyms.ContainsKey($firstNameLower)) {
+                    $synonym = $NameSynonyms[$firstNameLower]
+                    Write-Verbose "Trying name synonym: $onPremFirstName => $synonym"
+                    
+                    $candidateUPNs = @(
+                        "$synonym@$PrimaryDomain"
+                        ("{0}{1}@{2}" -f $synonym.Substring(0,1), $onPremLastName, $PrimaryDomain)
+                        ("{0}.{1}@{2}" -f $synonym, $onPremLastName, $PrimaryDomain)
+                    )
+
+                    foreach ($candidate in $candidateUPNs | Where-Object { $_ }) {
+                        Write-Verbose "Trying synonym-based UPN: $candidate"
+                        $potentialUser = $AzureUsersByUPN[$candidate.ToLower()]
+                        if ($potentialUser) {
+                            # We also might do a minimal name check here
+                            # It's possible the Azure user might store 'Michael' in GivenName 
+                            # and the on-prem is 'Mike' or vice versa. We'll skip the name check 
+                            # or just check last name for safety:
+                            if ($potentialUser.Surname -eq $onPremLastName) {
+                                Write-Verbose "Matched via synonym-based fallback: $candidate"
+                                $azureUser       = $potentialUser
+                                $finalMatchedUPN = $candidate
+                                break
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    # If still no match, log failure
+    # 5) If still no match, log a failure
     if (-not $azureUser) {
         $Results += [pscustomobject]@{
             OnPremUser         = $user.UserPrincipalName
@@ -223,8 +285,8 @@ foreach ($user in $OnPremUsers) {
         Write-Warning "FAILED: $($user.UserPrincipalName) => $primaryGuessUPN : No match in Azure AD"
         continue
     }
-    
-    # We have a match: add the final UPN to $ProcessedUPNs
+
+    # 6) We have a match: add the final UPN to $ProcessedUPNs
     $ProcessedUPNs += $finalMatchedUPN.ToLower()
 
     # Convert the on-prem AD ObjectGUID to a Base64 string
@@ -282,7 +344,6 @@ if ($OrphanedAzureUsers.Count -gt 0) {
     # Prepend domain discrepancy if any
     if ($domainDiscrepancy) {
         "DomainDiscrepancy: $domainDiscrepancy" | Out-File $OrphanReportCsvPath
-        # Then export the orphans with the 4 columns you specified
         $OrphanedAzureUsers |
             Select-Object `
                 GivenName,
@@ -292,7 +353,6 @@ if ($OrphanedAzureUsers.Count -gt 0) {
             Export-Csv -Path $OrphanReportCsvPath -NoTypeInformation -Append
     }
     else {
-        # No discrepancy – just export
         $OrphanedAzureUsers |
             Select-Object `
                 GivenName,
