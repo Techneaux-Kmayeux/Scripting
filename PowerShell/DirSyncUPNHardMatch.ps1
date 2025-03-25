@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Performs a hard match for each user in On-Prem AD to Azure AD by setting the OnPremisesImmutableId using Microsoft Graph.
-    Supports optional name synonym (hypocorism) lookups for FIRST NAMES ONLY via an external file.
+    Supports optional name synonym (hypocorism) lookups for FIRST NAMES ONLY via an external file in the same folder.
 
 .DESCRIPTION
     - Retrieves on-premises AD users (Get-ADUser).
@@ -10,7 +10,8 @@
     - Retrieves all Azure AD users once and builds a dictionary for fast lookups.
     - If the standard matching (primary guess + fallback patterns) fails,
       and if -UseNicknames is specified, attempts to map the on-prem FIRST NAME
-      to a set of synonyms from the provided file (ex: "Mike" => "Michael", "Mitchell", etc.).
+      to a set of synonyms from the provided (or default) file (e.g. "nicknames.txt" 
+      next to this script).
       We never modify or guess the LAST name from synonyms.
     - Logs successes and failures to CSV, prepending domain discrepancy once if needed.
     - Produces a trimmed orphan report with (GivenName, OnPremImmutableId, Surname, UPN).
@@ -32,9 +33,11 @@ param(
     [string]$PrimaryDomain        = $null,
     [string]$MSOLDomain           = $null,
 
-    # New parameters for nickname/hypocorism logic
+    # By default, -UseNicknames is OFF
     [bool]$UseNicknames           = $false,
-    [string]$NicknameFile         = $null
+
+    # By default, NicknameFile is "nicknames.txt" in the same folder as this script
+    [string]$NicknameFile = (Join-Path (Split-Path $MyInvocation.MyCommand.Path) "nicknames.txt")
 )
 
 ###############################################################################
@@ -111,7 +114,7 @@ else {
 $NameSynonyms = @{}  # dictionary for first-name synonyms
 
 if ($UseNicknames) {
-    if ($NicknameFile -and (Test-Path $NicknameFile)) {
+    if (Test-Path $NicknameFile) {
         Write-Host "Using nicknames from file: $NicknameFile"
 
         $lines = Get-Content -Path $NicknameFile
@@ -140,7 +143,7 @@ if ($UseNicknames) {
         }
     }
     else {
-        Write-Host "WARNING: -UseNicknames was specified but NicknameFile not provided or doesn't exist. Nickname logic will be skipped."
+        Write-Host "WARNING: -UseNicknames was specified but '$NicknameFile' does not exist. Nickname logic will be skipped."
     }
 }
 
@@ -281,7 +284,7 @@ foreach ($user in $OnPremUsers) {
                         ("{0}{1}@{2}" -f $synonym.Substring(0,1), $onPremLastName, $PrimaryDomain)
                         ("{0}.{1}@{2}" -f $synonym, $onPremLastName, $PrimaryDomain)
                     )
-                    # If there's a middle initial, you can optionally attempt that too, if you want
+                    # If there's a middle initial, optionally do that too
                     if ($onPremMiddle -and $onPremMiddle.Length -ge 1) {
                         $candidateUPNs += ("{0}{1}{2}@{3}" -f $synonym.Substring(0,1), $onPremMiddle.Substring(0,1), $onPremLastName, $PrimaryDomain)
                     }
@@ -292,7 +295,6 @@ foreach ($user in $OnPremUsers) {
                         $potentialUser = $AzureUsersByUPN[$candidate.ToLower()]
                         if ($potentialUser) {
                             # We'll do a minimal check that $potentialUser.Surname == $onPremLastName
-                            # because we do NOT change the last name from synonyms.
                             if ($potentialUser.Surname -eq $onPremLastName) {
                                 Write-Verbose "Matched via nickname-based fallback: $candidate"
                                 $azureUser       = $potentialUser
