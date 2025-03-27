@@ -1,20 +1,23 @@
 <#
 .SYNOPSIS
     Performs a hard match for each user in On-Prem AD to Azure AD by setting the OnPremisesImmutableId using Microsoft Graph.
-    Supports optional name synonym (hypocorism) lookups for FIRST NAMES ONLY via an external file in the same folder.
+    Additionally:
+     - Sets extensionAttribute13 = "ScriptSynced" on success to avoid re-processing those users (unless -ReSync is set).
+     - Has a global script timer that prints total runtime at completion or on error exit.
+     - Shows a progress metric (x / y) for normal runs.
+     - Provides two override params (-OnPremUPN and -AADUPN) to do a one-time direct sync for a single user, skipping all normal logic.
 
 .DESCRIPTION
-    - Retrieves on-premises AD users (Get-ADUser).
+    - Retrieves on-premises AD users (Get-ADUser), skipping those in Azure AD that are already flagged as "ScriptSynced" (unless -ReSync).
     - Constructs an Azure AD UPN from the on-prem UPN and the provided PrimaryDomain.
     - Converts the on-prem AD ObjectGUID to a Base64 string (ImmutableID).
     - Retrieves all Azure AD users once and builds a dictionary for fast lookups.
     - If the standard matching (primary guess + fallback patterns) fails,
-      and if -UseNicknames is specified, attempts to map the on-prem FIRST NAME
-      to a set of synonyms from the provided (or default) file (e.g. "nicknames.txt" 
-      next to this script).
-      We never modify or guess the LAST name from synonyms.
+      and if -UseNicknames is specified, attempts to map the on-prem FIRST NAME to synonyms from the provided (or default) file.
+      (But that logic is skipped if you do the single-user override using -OnPremUPN/-AADUPN.)
     - Logs successes and failures to CSV, prepending domain discrepancy once if needed.
     - Produces a trimmed orphan report with (GivenName, OnPremisesImmutableId, Surname, UPN).
+    - If both -OnPremUPN and -AADUPN are set, we skip normal logic and try to update that single user only.
 
 .NOTES
     - Requires: ActiveDirectory and Microsoft Graph modules.
@@ -33,19 +36,52 @@ param(
     [string]$PrimaryDomain        = $null,
     [string]$MSOLDomain           = $null,
 
+    # If false, we skip users who have extensionAttribute13 = "ScriptSynced"
+    # If true, we ignore that attribute and re-process them
+    [bool]$ReSync                 = $false,
+
     # By default, -UseNicknames is OFF
     [bool]$UseNicknames           = $false,
 
     # By default, NicknameFile is "nicknames.txt" in the same folder as this script
-    [string]$NicknameFile = (Join-Path (Split-Path $MyInvocation.MyCommand.Path) "nicknames.txt")
+    [string]$NicknameFile = (Join-Path (Split-Path $MyInvocation.MyCommand.Path) "nicknames.txt"),
+
+    # If BOTH of these are provided, skip normal logic and do a single direct sync
+    [string]$OnPremUPN            = $null,
+    [string]$AADUPN               = $null
 )
 
 ###############################################################################
-# 1. Validate required parameters
+# 0. Script Timer & Helper for Early Exit
 ###############################################################################
-if (-not $PrimaryDomain) {
-    Write-Host "ERROR: You MUST include the Org's Primary Domain. Example: -PrimaryDomain techneaux.com"
-    exit 1
+$scriptStart = Get-Date
+function StopAndExit($code) {
+    $elapsed = (Get-Date) - $scriptStart
+    Write-Host "Script ended. Total runtime: $elapsed"
+    exit $code
+}
+
+###############################################################################
+# 1. Validate required parameters (normal mode)
+###############################################################################
+# If the user provided only OnPremUPN or only AADUPN, fail
+if (($OnPremUPN -and -not $AADUPN) -or ($AADUPN -and -not $OnPremUPN)) {
+    Write-Warning "Both -OnPremUPN and -AADUPN must be provided together, or neither. Exiting..."
+    StopAndExit 7
+}
+
+# If both OnPremUPN and AADUPN are set, we skip all normal logic below (after basic module loads & connect)
+$singleUserOverride = $false
+if ($OnPremUPN -and $AADUPN) {
+    $singleUserOverride = $true
+}
+
+# If NOT singleUserOverride, proceed with normal param checks
+if (-not $singleUserOverride) {
+    if (-not $PrimaryDomain) {
+        Write-Host "ERROR: You MUST include the Org's Primary Domain. Example: -PrimaryDomain techneaux.com"
+        StopAndExit 1
+    }
 }
 
 ###############################################################################
@@ -56,7 +92,7 @@ try {
 }
 catch {
     Write-Host "ERROR: Microsoft Graph Module Failed to Install. Troubleshoot manually then re-run script."
-    exit 2
+    StopAndExit 2
 }
 
 ###############################################################################
@@ -75,20 +111,68 @@ try {
 }
 catch {
     Write-Host "ERROR: Failed to Connect to MgGraph. Troubleshoot manually then re-run."
-    exit 3
+    StopAndExit 3
 }
 
 ###############################################################################
-# 5. Verify PrimaryDomain against tenant’s default domain
+# If single-user override is set, do that logic here and then exit
+###############################################################################
+if ($singleUserOverride) {
+    Write-Host "Single-user override mode: linking On-Prem UPN '$OnPremUPN' to Azure UPN '$AADUPN'..."
+
+    # 1) Retrieve the on-prem user to get their ObjectGUID
+    try {
+        $onPremUserObj = Get-ADUser -Filter { UserPrincipalName -eq $OnPremUPN } -Properties ObjectGUID, Enabled
+    }
+    catch {
+        Write-Warning "Failed to retrieve OnPrem user $OnPremUPN: $($_.Exception.Message)"
+        StopAndExit 11
+    }
+
+    if (-not $onPremUserObj) {
+        Write-Warning "OnPrem user $OnPremUPN not found. Exiting..."
+        StopAndExit 12
+    }
+
+    # 2) Convert their GUID to Base64
+    $immutableId = [System.Convert]::ToBase64String($onPremUserObj.ObjectGUID.ToByteArray())
+
+    # 3) Attempt to update that AAD user
+    #    We won't retrieve the entire user object from Azure; we'll just call an update
+    #    If they don't exist or can't be updated, that'll fail with an exception
+    try {
+        # Set the OnPremisesImmutableId
+        Update-MgUser -UserId $AADUPN -OnPremisesImmutableId $immutableId -ErrorAction Stop
+
+        # Mark extensionAttribute13 = "ScriptSynced"
+        Update-MgUser -UserId $AADUPN -OnPremisesExtensionAttributes @{ ExtensionAttribute13 = "ScriptSynced" } -ErrorAction Stop
+
+        Write-Host "SUCCESS: Single-user override: Set OnPremisesImmutableId ($immutableId) for $OnPremUPN => $AADUPN"
+    }
+    catch {
+        Write-Warning "Failed to update $AADUPN : $($_.Exception.Message)"
+        StopAndExit 13
+    }
+
+    Write-Host "Single-user linking completed successfully."
+
+    # Print final timer & exit
+    $elapsed = (Get-Date) - $scriptStart
+    Write-Host "Script completed successfully in $elapsed"
+    Disconnect-MgGraph | Out-Null
+    exit 0
+}
+
+###############################################################################
+# 5. Verify PrimaryDomain against tenant’s default domain (normal mode only)
 ###############################################################################
 try {
-    # Retrieve organization info; the VerifiedDomains property contains the default domain.
     $org = Get-MgOrganization -ErrorAction Stop
     $defaultDomain = ($org.VerifiedDomains | Where-Object { $_.IsDefault -eq $true }).Name
 }
 catch {
     Write-Host "ERROR: Could not retrieve organization domain information."
-    exit 5
+    StopAndExit 5
 }
 
 $domainDiscrepancy = ""
@@ -97,7 +181,7 @@ if ($PrimaryDomain.ToLower() -ne $defaultDomain.ToLower()) {
     $response = Read-Host "Would you like to continue? (Y/N)"
     if ($response -notin @("Y","y")) {
         Write-Host "User opted to exit due to domain mismatch."
-        exit 6
+        StopAndExit 6
     }
     else {
         Write-Host "Continuing execution. Discrepancy logged."
@@ -109,7 +193,7 @@ else {
 }
 
 ###############################################################################
-# 6. Now that initial checks are done, optionally load Nickname File
+# 6. Load Nickname File if -UseNicknames
 ###############################################################################
 $NameSynonyms = @{}  # dictionary for first-name synonyms
 
@@ -119,16 +203,9 @@ if ($UseNicknames) {
 
         $lines = Get-Content -Path $NicknameFile
         foreach ($line in $lines) {
-            # Ignore empty lines or lines that are pure whitespace
-            if ([string]::IsNullOrWhiteSpace($line)) { continue }
-
-            # Split line by whitespace => array of names
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }  # skip empty lines
             $rawNames = $line -split '\s+' | Where-Object { $_ -ne "" }
-
-            # If somehow empty after split, skip
             if (-not $rawNames) { continue }
-
-            # For each name in that line, map it to all the others
             foreach ($oneName in $rawNames) {
                 $lowerName = $oneName.ToLower()
                 if (-not $NameSynonyms.ContainsKey($lowerName)) {
@@ -179,11 +256,21 @@ else {
 ###############################################################################
 Write-Host "Retrieving all Azure AD users..."
 try {
-    $AllAzureUsers = Get-MgUser -All -Property "GivenName","Surname","OnPremisesImmutableId","UserPrincipalName"
+    # We also need OnPremisesExtensionAttributes to see extensionAttribute13
+    $AllAzureUsers = Get-MgUser -All -Property "GivenName","Surname","OnPremisesImmutableId",
+                                     "UserPrincipalName","OnPremisesExtensionAttributes"
 }
 catch {
     Write-Host "ERROR: Failed to retrieve Azure AD users. Exiting."
-    exit 4
+    StopAndExit 4
+}
+
+# If not ReSync, skip those who are already ScriptSynced
+if (-not $ReSync) {
+    Write-Host "Filtering out Azure AD users who are already 'ScriptSynced' in extensionAttribute13..."
+    $AllAzureUsers = $AllAzureUsers | Where-Object {
+        $_.OnPremisesExtensionAttributes.ExtensionAttribute13 -ne "ScriptSynced"
+    }
 }
 
 $AzureUsersByUPN = @{}
@@ -200,13 +287,20 @@ $Results       = @()
 $ProcessedUPNs = @()
 
 ###############################################################################
-# 11. Process each On-Prem AD user
+# 11. Process each On-Prem AD user (with progress metric)
 ###############################################################################
+$totalUsers = $OnPremUsers.Count
+$currentUserIndex = 0
+
 foreach ($user in $OnPremUsers) {
+    $currentUserIndex++
+
+    # Progress preamble
+    Write-Host "[ $currentUserIndex / $totalUsers ] Attempting user $($user.UserPrincipalName)..."
 
     # Skip if no UPN exists
     if (-not $user.UserPrincipalName) {
-        Write-Warning "Skipping user $($user.SamAccountName) - no UPN found."
+        Write-Warning "[ $currentUserIndex / $totalUsers ] Skipping user $($user.SamAccountName) - no UPN found."
         continue
     }
 
@@ -215,7 +309,7 @@ foreach ($user in $OnPremUsers) {
     $onPremLastName  = $user.Surname
     $onPremMiddle    = $user.MiddleName
 
-    # Optional parse SamAccountName if needed (lack of given/surname)
+    # Optional parse SamAccountName if needed
     if ((-not $onPremFirstName -or -not $onPremLastName) -and $user.SamAccountName -and $user.SamAccountName.Contains(" ")) {
         $parts = $user.SamAccountName.Split(" ", 2)
         if ($parts.Count -eq 2) {
@@ -225,44 +319,38 @@ foreach ($user in $OnPremUsers) {
         }
     }
 
-    # 1) Build a primary guess for Azure AD UPN
+    # Build a primary guess for Azure AD UPN
     $localPart       = $user.UserPrincipalName.Split('@')[0]
     $primaryGuessUPN = "$localPart@$PrimaryDomain"
 
     $azureUser       = $AzureUsersByUPN[$primaryGuessUPN.ToLower()]
     $finalMatchedUPN = $null
 
-    # 2) If the primary guess is found, great
+    # If the primary guess is found, great
     if ($azureUser) {
         $finalMatchedUPN = $primaryGuessUPN
     }
     else {
-        # 3) Fallback patterns if we have some first/last
+        # Fallback patterns if we have some first/last
         if ($onPremFirstName -and $onPremLastName) {
             $candidateUPNs = @()
-            # firstName@domain
             $candidateUPNs += "$onPremFirstName@$PrimaryDomain"
-
-            # firstInitial + lastName
             if ($onPremFirstName.Length -ge 1 -and $onPremLastName.Length -ge 1) {
                 $candidateUPNs += ("{0}{1}@{2}" -f $onPremFirstName.Substring(0,1), $onPremLastName, $PrimaryDomain)
             }
-            # firstInitial + middleInitial + lastName
             if ($onPremMiddle -and $onPremMiddle.Length -ge 1) {
                 $candidateUPNs += ("{0}{1}{2}@{3}" -f $onPremFirstName.Substring(0,1), $onPremMiddle.Substring(0,1), $onPremLastName, $PrimaryDomain)
             }
-            # firstName + lastNameInitial
             if ($onPremLastName.Length -ge 1) {
                 $candidateUPNs += ("{0}{1}@{2}" -f $onPremFirstName, $onPremLastName.Substring(0,1), $PrimaryDomain)
             }
-            # firstName.lastName
             $candidateUPNs += ("{0}.{1}@{2}" -f $onPremFirstName, $onPremLastName, $PrimaryDomain)
 
             foreach ($candidate in $candidateUPNs | Where-Object { $_ }) {
                 Write-Verbose "Trying fallback UPN: $candidate"
                 $potentialUser = $AzureUsersByUPN[$candidate.ToLower()]
                 if ($potentialUser) {
-                    # Check name match to avoid collisions
+                    # Check name match
                     if ($potentialUser.GivenName -eq $onPremFirstName -and $potentialUser.Surname -eq $onPremLastName) {
                         $azureUser       = $potentialUser
                         $finalMatchedUPN = $candidate
@@ -272,34 +360,25 @@ foreach ($user in $OnPremUsers) {
             }
         }
 
-        # 4) If still no match and -UseNicknames is true, attempt synonyms for FIRST NAME only
-        #    BUT only if we have a valid first/last name
+        # Nickname fallback
         if (-not $finalMatchedUPN -and $UseNicknames `
             -and (-not [string]::IsNullOrWhiteSpace($onPremFirstName)) `
             -and (-not [string]::IsNullOrWhiteSpace($onPremLastName))) {
 
             $firstNameLower = $onPremFirstName.ToLower()
             if ($NameSynonyms.ContainsKey($firstNameLower)) {
-                $synonyms = $NameSynonyms[$firstNameLower]  # a list of other possible first-name forms
+                $synonyms = $NameSynonyms[$firstNameLower]
                 foreach ($synonym in $synonyms) {
                     $candidateUPNs = @()
-
-                    # Build fallback patterns for $synonym + original last name, 
-                    # but only if last name has length
                     $candidateUPNs += "$synonym@$PrimaryDomain"
-
                     if ($onPremLastName.Length -ge 1) {
-                        # synonymInitial + lastName
                         if ($synonym.Length -ge 1) {
                             $candidateUPNs += ("{0}{1}@{2}" -f $synonym.Substring(0,1), $onPremLastName, $PrimaryDomain)
                         }
-                        # synonym + lastNameInitial
                         $candidateUPNs += ("{0}{1}@{2}" -f $synonym, $onPremLastName.Substring(0,1), $PrimaryDomain)
-                        # synonym.middleInitial.lastName?
                         if ($onPremMiddle -and $onPremMiddle.Length -ge 1 -and $synonym.Length -ge 1) {
                             $candidateUPNs += ("{0}{1}{2}@{3}" -f $synonym.Substring(0,1), $onPremMiddle.Substring(0,1), $onPremLastName, $PrimaryDomain)
                         }
-                        # synonym.lastName
                         $candidateUPNs += ("{0}.{1}@{2}" -f $synonym, $onPremLastName, $PrimaryDomain)
                     }
 
@@ -307,24 +386,21 @@ foreach ($user in $OnPremUsers) {
                         Write-Verbose "Trying nickname-based UPN: $candidate"
                         $potentialUser = $AzureUsersByUPN[$candidate.ToLower()]
                         if ($potentialUser) {
-                            # We'll do a minimal check that $potentialUser.Surname == $onPremLastName
                             if ($potentialUser.Surname -eq $onPremLastName) {
-                                Write-Verbose "Matched via nickname-based fallback: $candidate"
+                                Write-Verbose "Matched via nickname fallback: $candidate"
                                 $azureUser       = $potentialUser
                                 $finalMatchedUPN = $candidate
                                 break
                             }
                         }
                     }
-
-                    # If we found a match, break out
                     if ($finalMatchedUPN) { break }
                 }
             }
         }
     }
 
-    # 5) If still no match, record failure
+    # If still no match, record failure
     if (-not $azureUser) {
         $Results += [pscustomobject]@{
             OnPremUser         = $user.UserPrincipalName
@@ -336,22 +412,25 @@ foreach ($user in $OnPremUsers) {
             PreviousID         = $null
             DomainDiscrepancy  = $domainDiscrepancy
         }
-        Write-Warning "FAILED: $($user.UserPrincipalName) => $primaryGuessUPN : No match in Azure AD"
+        Write-Warning "[ $currentUserIndex / $totalUsers ] FAILED: $($user.UserPrincipalName) => $primaryGuessUPN : No match in Azure AD"
         continue
     }
 
-    # 6) We have a match: add the final UPN to $ProcessedUPNs
+    # We have a match: add the final UPN to $ProcessedUPNs
     $ProcessedUPNs += $finalMatchedUPN.ToLower()
 
     # Convert the on-prem AD ObjectGUID to a Base64 string
     $immutableId = [System.Convert]::ToBase64String($user.ObjectGUID.ToByteArray())
 
-    # Retrieve previous OnPremisesImmutableId
-    $priorId = $azureUser.OnPremisesImmutableId
-
     # Attempt to update
     try {
+        # 1) Set OnPremisesImmutableId
         Update-MgUser -UserId $finalMatchedUPN -OnPremisesImmutableId $immutableId -ErrorAction Stop
+
+        # 2) Mark extensionAttribute13 = "ScriptSynced"
+        Update-MgUser -UserId $finalMatchedUPN -OnPremisesExtensionAttributes @{
+            ExtensionAttribute13 = "ScriptSynced"
+        } -ErrorAction Stop
 
         $Results += [pscustomobject]@{
             OnPremUser         = $user.UserPrincipalName
@@ -360,11 +439,11 @@ foreach ($user in $OnPremUsers) {
             Reason             = ""
             OnPremEnabled      = $user.Enabled
             NewID              = $immutableId
-            PreviousID         = $priorId
+            PreviousID         = $azureUser.OnPremisesImmutableId
             DomainDiscrepancy  = $domainDiscrepancy
         }
         
-        Write-Host "SUCCESS: Set OnPremisesImmutableId for $($user.UserPrincipalName) => $finalMatchedUPN"
+        Write-Host "[ $currentUserIndex / $totalUsers ] SUCCESS: Set OnPremisesImmutableId for $($user.UserPrincipalName) => $finalMatchedUPN"
     }
     catch {
         $Results += [pscustomobject]@{
@@ -374,10 +453,10 @@ foreach ($user in $OnPremUsers) {
             Reason             = $_.Exception.Message
             OnPremEnabled      = $user.Enabled
             NewID              = $immutableId
-            PreviousID         = $priorId
+            PreviousID         = $azureUser.OnPremisesImmutableId
             DomainDiscrepancy  = $domainDiscrepancy
         }
-        Write-Warning "FAILED: $($user.UserPrincipalName) => $finalMatchedUPN : $($_.Exception.Message)"
+        Write-Warning "[ $currentUserIndex / $totalUsers ] FAILED: $($user.UserPrincipalName) => $finalMatchedUPN : $($_.Exception.Message)"
     }
 }
 
@@ -387,7 +466,6 @@ foreach ($user in $OnPremUsers) {
 $OrphanedAzureUsers = @()
 foreach ($key in $AzureUsersByUPN.Keys) {
     if (-not ($ProcessedUPNs -contains $key)) {
-        # This user was never matched
         $OrphanedAzureUsers += $AzureUsersByUPN[$key]
     }
 }
@@ -452,6 +530,10 @@ else {
 }
 
 ###############################################################################
-# 14. Disconnect from Microsoft Graph
+# 14. Disconnect from Microsoft Graph & Final Timer
 ###############################################################################
+$elapsed = (Get-Date) - $scriptStart
+Write-Host "Script completed successfully in $elapsed"
+
 Disconnect-MgGraph | Out-Null
+exit 0
