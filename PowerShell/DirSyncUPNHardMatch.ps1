@@ -125,7 +125,7 @@ if ($singleUserOverride) {
         $onPremUserObj = Get-ADUser -Filter { UserPrincipalName -eq $OnPremUPN } -Properties ObjectGUID, Enabled
     }
     catch {
-        Write-Warning "Failed to retrieve OnPrem user $OnPremUPN: $($_.Exception.Message)"
+        Write-Warning "Failed to retrieve OnPrem user $OnPremUPN : $($_.Exception.Message)"
         StopAndExit 11
     }
 
