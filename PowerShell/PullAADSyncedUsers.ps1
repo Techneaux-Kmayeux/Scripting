@@ -1,68 +1,163 @@
 <#
 .SYNOPSIS
-    Exports all Azure AD users who have "On-premises sync enabled" = True.
-    Optionally attempts to look up their matching on-prem user in AD by decoding OnPremisesImmutableId.
+    Retrieves all Azure AD users where OnPremisesSyncEnabled = True,
+    correlates them to on-prem AD (first by sAMAccountName match, then by DisplayName guess),
+    then exports a CSV with:
+      AAD_UPN, AAD_DisplayName, OnPrem_UPN, OnPrem_FirstName, OnPrem_LastName, OnPrem_DistinguishedName
 
 .DESCRIPTION
-    - Retrieves all Azure AD users with .OnPremisesSyncEnabled = $true.
-    - Exports them to a CSV with DisplayName, UserPrincipalName, and OnPremisesImmutableId.
-    - If OnPremisesImmutableId is present, decodes it and uses Get-ADUser to find the matching AD user (by GUID).
-    - Adds columns for the AD user's CN and SamAccountName if found.
+    - Connects to Microsoft Graph, gets all users with OnPremisesSyncEnabled = $true.
+    - For each, parse local part of UPN => sAMAccountName. 
+      If that fails, split DisplayName into "first + last" tokens, attempt (givenName, sn) match.
+    - The script then retrieves userprincipalname, givenname, sn, and especially "distinguishedName" from AD,
+      to show the full path "CN=...,OU=...,DC=..." for that user.
+
+.NOTES
+    - Must run with domain privileges to read AD, and Graph access to read all user objects.
+    - If multiple or zero AD matches appear, we skip or warn. 
 #>
 
-# 1) Connect to Graph (if not already done):
+###############################################################################
+# 1) Connect to Microsoft Graph
+###############################################################################
 Connect-MgGraph -Scopes "User.Read.All"
-# or if already connected in your session, skip
 
-# 2) Retrieve all AAD users with OnPremisesSyncEnabled = $true
-Write-Host "Retrieving Azure AD users who are OnPremisesSyncEnabled..."
-$allSynced = Get-MgUser -All -Property DisplayName,UserPrincipalName,OnPremisesSyncEnabled,OnPremisesImmutableId `
-             | Where-Object { $_.OnPremisesSyncEnabled -eq $true }
+Write-Host "Retrieving Azure AD users who have OnPremisesSyncEnabled = True..."
 
-Write-Host "Found $($allSynced.Count) users with OnPremisesSyncEnabled = True."
+# 2) Retrieve all AAD users with that flag
+$allAzureUsers = Get-MgUser -All -Property "DisplayName","UserPrincipalName","OnPremisesSyncEnabled" `
+    | Where-Object { $_.OnPremisesSyncEnabled -eq $true }
 
-# 3) For each user, optionally decode the OnPremisesImmutableId and look up in AD
-$results = foreach ($u in $allSynced) {
+Write-Host "Found $($allAzureUsers.Count) such AAD users."
 
-    # We'll decode the OnPremisesImmutableId if it exists
-    $decodedGuid = $null
-    $adCN        = $null
-    $adSam       = $null
+###############################################################################
+# 3) We'll store final correlation data here
+###############################################################################
+$results = @()
 
-    if ($u.OnPremisesImmutableId) {
-        try {
-            # Decode from Base64 => raw GUID bytes => construct a Guid object
-            $guidBytes = [System.Convert]::FromBase64String($u.OnPremisesImmutableId)
-            $decodedGuid = New-Object Guid($guidBytes)
+###############################################################################
+# 4) Helper function: search by sAMAccountName
+###############################################################################
+function Try-SamAccountName($sam) {
+    $searcher = [ADSISearcher]"(sAMAccountName=$($sam))"
+    $searcher.PageSize = 5000
+    return $searcher.FindOne()
+}
 
-            # Attempt to find the AD user with that GUID
-            $adUser = Get-ADUser -Filter { ObjectGUID -eq $decodedGuid } -Properties SamAccountName, CN -ErrorAction SilentlyContinue
+###############################################################################
+# 5) Helper function: search by (givenName=xxx)(sn=yyy)
+###############################################################################
+function Try-GivenNameSn($given, $sn) {
+    $filter = "(&(objectClass=user)(givenName=$($given))(sn=$($sn)))"
+    $searcher = [ADSISearcher]$filter
+    $searcher.PageSize = 5000
+    return $searcher.FindAll()
+}
 
-            if ($adUser) {
-                $adCN  = $adUser.CN
-                $adSam = $adUser.SamAccountName
+###############################################################################
+# 6) Main loop over each AAD user
+###############################################################################
+foreach ($user in $allAzureUsers) {
+
+    $azureUPN         = $user.UserPrincipalName
+    $azureDisplayName = $user.DisplayName
+
+    # Extract local part of UPN => potential sAMAccountName
+    $localPart = $null
+    if ($azureUPN -match '@') {
+        $localPart = $azureUPN.Split('@')[0]
+    }
+    else {
+        # fallback if there's no domain portion
+        $localPart = $azureUPN
+    }
+
+    # Prepare placeholders
+    $onPremUPN       = $null
+    $onPremFirstName = $null
+    $onPremLastName  = $null
+    $onPremDN        = $null  # We'll store distinguishedName here
+
+    ###########################################################################
+    # 6a) Attempt sAMAccountName = localPart
+    ###########################################################################
+    $found = $null
+    if ($localPart) {
+        $found = Try-SamAccountName $localPart
+    }
+
+    if ($found) {
+        # DistName
+        $onPremDN        = $found.Properties['distinguishedname']
+        $onPremUPN       = $found.Properties['userprincipalname']
+        $onPremFirstName = $found.Properties['givenname']
+        $onPremLastName  = $found.Properties['sn']
+    }
+    else {
+        # 6b) Attempt fallback parse of DisplayName => (first, last)
+        if ($azureDisplayName -and $azureDisplayName.Contains(" ")) {
+            $tokens = $azureDisplayName.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+            if ($tokens.Count -ge 2) {
+                $guessedFirst = $tokens[0]
+                $guessedLast  = $tokens[$tokens.Count - 1]
+
+                $matches = Try-GivenNameSn $guessedFirst $guessedLast
+
+                if ($matches -and $matches.Count -eq 1) {
+                    # We'll pick this single match
+                    $item = $matches[0]
+                    $onPremDN        = $item.Properties['distinguishedname']
+                    $onPremUPN       = $item.Properties['userprincipalname']
+                    $onPremFirstName = $item.Properties['givenname']
+                    $onPremLastName  = $item.Properties['sn']
+                }
+                elseif ($matches.Count -gt 1) {
+                    Write-Warning "Multiple on-prem AD matches for name '$guessedFirst $guessedLast' => skipping user $azureUPN"
+                }
+                else {
+                    Write-Warning "No on-prem AD user found for guessed name '$guessedFirst $guessedLast' => $azureUPN"
+                }
+            }
+            else {
+                Write-Warning "DisplayName '$azureDisplayName' has fewer than 2 tokens => skipping name fallback for $azureUPN"
             }
         }
-        catch {
-            Write-Warning "Failed to decode OnPremisesImmutableId or find AD user for $($u.UserPrincipalName): $($_.Exception.Message)"
+        else {
+            Write-Warning "No space in DisplayName or no DisplayName => skipping name fallback for $azureUPN"
         }
     }
 
-    # Construct an output object
-    [pscustomobject]@{
-        DisplayName           = $u.DisplayName
-        UserPrincipalName     = $u.UserPrincipalName
-        OnPremisesImmutableId = $u.OnPremisesImmutableId
-        DecodedGUID           = $decodedGuid
-        AD_CN                 = $adCN
-        AD_SamAccountName     = $adSam
+    # Convert arrays to strings (distinguishedName is often an array of 1)
+    if ($onPremDN -is [System.Collections.IEnumerable]) {
+        $onPremDN = $onPremDN -join '; '
+    }
+    if ($onPremFirstName -is [System.Collections.IEnumerable]) {
+        $onPremFirstName = $onPremFirstName -join '; '
+    }
+    if ($onPremLastName -is [System.Collections.IEnumerable]) {
+        $onPremLastName = $onPremLastName -join '; '
+    }
+    if ($onPremUPN -is [System.Collections.IEnumerable]) {
+        $onPremUPN = $onPremUPN -join '; '
+    }
+
+    ###########################################################################
+    # 6c) Add result row
+    ###########################################################################
+    $results += [pscustomobject]@{
+        AAD_UPN              = $azureUPN
+        AAD_DisplayName      = $azureDisplayName
+        OnPrem_UPN           = $onPremUPN
+        OnPrem_FirstName     = $onPremFirstName
+        OnPrem_LastName      = $onPremLastName
+        OnPrem_DistinguishedName = $onPremDN
     }
 }
 
-# 4) Export to CSV
-$csvPath = "C:\Temp\OnPremSyncEnabled_Users.csv"
-$results | Export-Csv -Path $csvPath -NoTypeInformation
-Write-Host "Exported $($results.Count) users to $csvPath"
+###############################################################################
+# 7) Export to CSV
+###############################################################################
+$csvPath = "C:\Techneaux\AAD_OnPrem_Correlation_DistinguishedName.csv"
+$results | Export-Csv -NoTypeInformation -Path $csvPath
 
-# 5) (Optional) Disconnect if you want
-# Disconnect-MgGraph
+Write-Host "`nExported $($results.Count) records to $csvPath. Done."

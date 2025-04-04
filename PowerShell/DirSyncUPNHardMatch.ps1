@@ -26,9 +26,9 @@
 #>
 
 param(
-    [string]$FailureCsvPath       = "C:\Techneaux\HardLinkScript\HardMatchFailures.csv",
-    [string]$SuccessCsvPath       = "C:\Techneaux\HardLinkScript\HardMatchSuccessLog.csv",
-    [string]$OrphanReportCsvPath  = "C:\Techneaux\HardLinkScript\AzureNotInAD.csv",
+    [string]$FailureCsvPath       = "$PSScriptRoot\Logs\DirSyncUPNHardMatch_Failure_$(Get-Date).ToString("yyyyMMdd_HHmmss").csv",
+    [string]$SuccessCsvPath       = "$PSScriptRoot\Logs\DirSyncUPNHardMatch_Success_$(Get-Date).ToString("yyyyMMdd_HHmmss").csv",
+    [string]$OrphanReportCsvPath  = "$PSScriptRoot\Logs\AzureNotInAD_$(Get-Date).ToString("yyyyMMdd_HHmmss").csv",
 
     [int]$MaxUsers                = 20,
     [bool]$FullSend               = $false,
@@ -50,6 +50,12 @@ param(
     [string]$OnPremUPN            = $null,
     [string]$AADUPN               = $null
 )
+
+# Ensure log directory exists
+$logDirectory = "$PSScriptRoot\Logs"
+if (-not (Test-Path -Path $logDirectory)) {
+    New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+}
 
 ###############################################################################
 # 0. Script Timer & Helper for Early Exit
@@ -225,21 +231,7 @@ if ($UseNicknames) {
 }
 
 ###############################################################################
-# 7. Ensure directories for CSV files exist
-###############################################################################
-$successDirectory = [System.IO.Path]::GetDirectoryName($SuccessCsvPath)
-$failureDirectory = [System.IO.Path]::GetDirectoryName($FailureCsvPath)
-$orphanDirectory  = [System.IO.Path]::GetDirectoryName($OrphanReportCsvPath)
-
-foreach ($dir in @($successDirectory, $failureDirectory, $orphanDirectory)) {
-    if (-not (Test-Path $dir)) {
-        Write-Host "Directory $dir does not exist. Creating..."
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    }
-}
-
-###############################################################################
-# 8. Retrieve On-Prem AD users
+# 7. Retrieve On-Prem AD users
 ###############################################################################
 if ($FullSend) {
     Write-Host "FULL SEND: Retrieving ALL On-Prem AD users..."
@@ -252,7 +244,7 @@ else {
 }
 
 ###############################################################################
-# 9. Retrieve all Azure AD users once and build a dictionary for fast lookup
+# 8. Retrieve all Azure AD users once and build a dictionary for fast lookup
 ###############################################################################
 Write-Host "Retrieving all Azure AD users..."
 try {
@@ -281,13 +273,13 @@ foreach ($u in $AllAzureUsers) {
 }
 
 ###############################################################################
-# 10. Prepare a collection to store output results and track processed UPNs
+# 9. Prepare a collection to store output results and track processed UPNs
 ###############################################################################
 $Results       = @()
 $ProcessedUPNs = @()
 
 ###############################################################################
-# 11. Process each On-Prem AD user (with progress metric)
+# 10. Process each On-Prem AD user (with progress metric)
 ###############################################################################
 $totalUsers = $OnPremUsers.Count
 $currentUserIndex = 0
@@ -461,7 +453,7 @@ foreach ($user in $OnPremUsers) {
 }
 
 ###############################################################################
-# 12. Cross-reference: Identify Azure users not present in on-prem AD
+# 11. Cross-reference: Identify Azure users not present in on-prem AD
 ###############################################################################
 $OrphanedAzureUsers = @()
 foreach ($key in $AzureUsersByUPN.Keys) {
@@ -500,7 +492,7 @@ else {
 }
 
 ###############################################################################
-# 13. Output and export final results
+# 12. Output and export final results
 ###############################################################################
 Write-Host "`n--- Summary of Hard Matching Operations ---"
 $Results | Format-Table -AutoSize
@@ -530,7 +522,7 @@ else {
 }
 
 ###############################################################################
-# 14. Disconnect from Microsoft Graph & Final Timer
+# 13. Disconnect from Microsoft Graph & Final Timer
 ###############################################################################
 $elapsed = (Get-Date) - $scriptStart
 Write-Host "Script completed successfully in $elapsed"
