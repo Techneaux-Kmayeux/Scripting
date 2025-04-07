@@ -52,3 +52,10 @@ foreach ($reg in $registryPaths) {
         Write-Log "Registry key already removed: $reg"
     }
 }
+
+# Step 4: Force Intune Sync
+Write-Log "Triggering Intune Sync..."
+Get-ScheduledTask -TaskName "PushLaunch" | Start-ScheduledTask
+Write-Log "Intune Sync command executed."
+
+Write-Log "Process complete. Reboot recommended."
