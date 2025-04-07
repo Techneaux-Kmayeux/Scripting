@@ -1,23 +1,29 @@
 <#
 .SYNOPSIS
-    Creates/Updates two scheduled tasks for Entra ID Join and Intune Enrollment, with custom triggers.
+    Ensures Entra (Azure AD) Join & Intune Enrollment tasks, verifies success,
+    and updates NinjaOne custom field "entraIntuneJoinState."
 
 .DESCRIPTION
-    1) Entra ID Join Task:
-        - dsregcmd /join
-        - Triggers:
-            a) At Log On of any user, repeats every 1 hour for 1 day
-            b) On event (Log: Microsoft-Windows-User Device Registration/Admin,
-                        Source: Microsoft-Windows-User Device Registration,
-                        Event ID: 4096), repeats every 1 hour for 1 day
-    2) Intune Enrollment Task:
-        - deviceenroller.exe /c /AutoEnrollMDMUsingAADDeviceCredential
-        - Trigger:
-            a) One-time start (in near future), repeats every 5 minutes for 1 day
+    1) Creates/updates a scheduled task for Entra Join (dsregcmd /join) at:
+       - Task path: "\Microsoft\Windows\Workplace Join"
+       - Task name: "Automatic-Device-Join"
+       - Triggers:
+         a) At Log On of any user, repeating every 1 hour for 1 day
+         b) On event (Log = "Microsoft-Windows-User Device Registration/Admin",
+                      Event ID = 4096), also repeating every 1 hour for 1 day
+    2) Creates/updates a scheduled task for Intune Enrollment:
+       - Task path: "\Microsoft\Windows\EnterpriseMgmt"
+       - Task name: "MDM-Enrollment"
+       - Action = "deviceenroller.exe /c /AutoEnrollMDMUsingAADDeviceCredential"
+       - Trigger = One time (in ~2 minutes), repeating every 5 minutes for 1 day
+    3) Runs each task (Entra -> Intune), waiting and verifying via dsregcmd /status.
+    4) Sets the NinjaOne custom field "entraIntuneJoinState" with either "Both",
+       "Entra", "Intune", or "None," depending on the final state.
 
-    After creation, the script starts the Entra join task, checks dsregcmd /status,
-    then starts the Intune task, checks enrollment. Adjust intervals and durations as needed.
-
+.NOTES
+    - Requires admin privileges to register tasks in Windows Task Scheduler.
+    - "Ninja-Property-Set entraIntuneJoinState <Value>" only works if this script is run
+      by the NinjaOne agent, with that custom field pre-created and set to script write access.
 #>
 
 [CmdletBinding()]
@@ -108,7 +114,7 @@ function Ensure-IntuneMDMTask {
     # ACTION
     $action = New-ScheduledTaskAction -Execute $IntuneCommand -Argument $IntuneArguments
 
-    # TRIGGER: One time (a couple minutes from now), repeat every 5 mins for 1 day
+    # TRIGGER: One time (2 minutes from now), repeat every 5 mins for 1 day
     $onceTrigger = New-ScheduledTaskTrigger -Once `
         -At (Get-Date).AddMinutes(2) `
         -RepetitionInterval (New-TimeSpan -Minutes 5) `
@@ -136,12 +142,14 @@ Ensure-IntuneMDMTask
 Write-Host "Starting Entra ID join task: [$EntraTaskPath\$EntraTaskName]..."
 Start-ScheduledTask -TaskPath $EntraTaskPath -TaskName $EntraTaskName
 
-Write-Host "Waiting 60 seconds for Entra join to complete..."
+Write-Host "Waiting 60 seconds for Entra join to (hopefully) complete..."
 Start-Sleep -Seconds 60
 
 $dsregStatus = dsregcmd /status
+$AzureAdJoined = $false
 if ($dsregStatus -match "AzureAdJoined\s*:\s*YES") {
     Write-Host "Device successfully joined to Entra ID (Azure AD)."
+    $AzureAdJoined = $true
 } else {
     Write-Warning "Entra ID join not confirmed. Check dsregcmd /status manually."
 }
@@ -152,15 +160,40 @@ if ($dsregStatus -match "AzureAdJoined\s*:\s*YES") {
 Write-Host "Starting Intune enrollment task: [$IntuneTaskPath\$IntuneTaskName]..."
 Start-ScheduledTask -TaskPath $IntuneTaskPath -TaskName $IntuneTaskName
 
-Write-Host "Waiting 60 seconds for Intune enrollment to complete..."
+Write-Host "Waiting 60 seconds for Intune enrollment to (hopefully) complete..."
 Start-Sleep -Seconds 60
 
 # Check dsregcmd /status for MDM reference, e.g. "MDM : Microsoft Intune"
 $mdmStatus = dsregcmd /status
+$IntuneEnrolled = $false
 if ($mdmStatus -match "MDM\s*:\s*Microsoft Intune") {
     Write-Host "Device successfully enrolled in Intune."
+    $IntuneEnrolled = $true
 } else {
     Write-Warning "Intune enrollment not confirmed. Check dsregcmd /status manually."
+}
+
+###############################################################################
+# 4. Determine final join state & update NinjaOne custom field
+###############################################################################
+$joinState = "None"  # default if neither is set
+
+if ($AzureAdJoined -and $IntuneEnrolled) {
+    $joinState = "Both"
+} elseif ($AzureAdJoined) {
+    $joinState = "Entra"
+} elseif ($IntuneEnrolled) {
+    $joinState = "Intune"
+}
+
+Write-Host "Final device join state: $joinState"
+# If running in the NinjaOne environment, this sets the custom field:
+try {
+    Ninja-Property-Set entraIntuneJoinState $joinState
+    Write-Host "Updated NinjaOne custom field 'entraIntuneJoinState' to '$joinState'."
+}
+catch {
+    Write-Warning "Could not set 'entraIntuneJoinState': $($_.Exception.Message)"
 }
 
 Write-Host "Script complete."
