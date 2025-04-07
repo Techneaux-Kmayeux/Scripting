@@ -1,109 +1,166 @@
-###############################################################################
-# This script ensures a device is joined to Entra ID (Azure AD) and enrolled in
-# Intune (MDM). It will:
-#   1. Check for (and create if missing) the Entra join Scheduled Task.
-#   2. Check for (and create if missing) the Intune enrollment Scheduled Task.
-#   3. Run each task sequentially, verifying success.
-#   4. If SCCM is detected, advise the user to run the SCCM Killer script.
-###############################################################################
+<#
+.SYNOPSIS
+    Creates/Updates two scheduled tasks for Entra ID Join and Intune Enrollment, with custom triggers.
 
-# Define task paths & names
-$EntraTaskPath  = "\Microsoft\Windows\Workplace Join"
-$EntraTaskName  = "Automatic-Device-Join"
-$IntuneTaskPath = "\Microsoft\Windows\EnterpriseMgmt"
-$IntuneTaskName = "MDM Enrollment"
+.DESCRIPTION
+    1) Entra ID Join Task:
+        - dsregcmd /join
+        - Triggers:
+            a) At Log On of any user, repeats every 1 hour for 1 day
+            b) On event (Log: Microsoft-Windows-User Device Registration/Admin,
+                        Source: Microsoft-Windows-User Device Registration,
+                        Event ID: 4096), repeats every 1 hour for 1 day
+    2) Intune Enrollment Task:
+        - deviceenroller.exe /c /AutoEnrollMDMUsingAADDeviceCredential
+        - Trigger:
+            a) One-time start (in near future), repeats every 5 minutes for 1 day
+
+    After creation, the script starts the Entra join task, checks dsregcmd /status,
+    then starts the Intune task, checks enrollment. Adjust intervals and durations as needed.
+
+#>
+
+[CmdletBinding()]
+param()
 
 ###############################################################################
-# Helper: Check if a scheduled task exists
+# SETTINGS
+###############################################################################
+$EntraTaskPath      = "\Microsoft\Windows\Workplace Join"
+$EntraTaskName      = "Automatic-Device-Join"
+
+$IntuneTaskPath     = "\Microsoft\Windows\EnterpriseMgmt"
+$IntuneTaskName     = "MDM-Enrollment"
+
+# The dsregcmd command for Entra ID join:
+$EntraCommand       = "C:\Windows\System32\dsregcmd.exe"
+$EntraArguments     = "/join"
+
+# The Intune enrollment command:
+$IntuneCommand      = "C:\Windows\System32\deviceenroller.exe"
+$IntuneArguments    = "/c /AutoEnrollMDMUsingAADDeviceCredential"
+
+###############################################################################
+# HELPER: Test if Scheduled Task exists
 ###############################################################################
 function Test-ScheduledTask {
     param(
-        [string]$TaskPath,
-        [string]$TaskName
+        [Parameter(Mandatory=$true)] [string]$TaskPath,
+        [Parameter(Mandatory=$true)] [string]$TaskName
     )
-    $found = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
-    return ($null -ne $found)
+    $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
+    return ($null -ne $task)
 }
 
 ###############################################################################
-# Helper: Create the Entra ID join task
+# HELPER: Create/Update Entra ID Join Task
 ###############################################################################
-function New-EntraIDJoinTask {
-    $action = New-ScheduledTaskAction -Execute "C:\Windows\System32\dsregcmd.exe" -Argument "/join"
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
-    Register-ScheduledTask -TaskPath $EntraTaskPath -TaskName $EntraTaskName -Action $action -Trigger $trigger -RunLevel Highest -Description "Automatically joins the device to Entra ID."
+function Ensure-EntraIDJoinTask {
+    if (Test-ScheduledTask -TaskPath $EntraTaskPath -TaskName $EntraTaskName) {
+        Write-Host "Entra ID join task [$EntraTaskPath\$EntraTaskName] already exists."
+        return
+    }
+
+    Write-Host "Creating Entra ID join task [$EntraTaskPath\$EntraTaskName]..."
+
+    # ACTION
+    $action = New-ScheduledTaskAction -Execute $EntraCommand -Argument $EntraArguments
+
+    # TRIGGERS:
+    # 1) AtLogOn trigger, repeats every 1 hour for 1 day
+    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn `
+        -RepetitionInterval (New-TimeSpan -Hours 1) `
+        -RepetitionDuration (New-TimeSpan -Days 1)
+
+    # 2) OnEvent trigger: Microsoft-Windows-User Device Registration/Admin, EventID = 4096
+    #    repeats every 1 hour for 1 day
+    $eventTrigger = New-ScheduledTaskTrigger -Once `
+        -Log "Microsoft-Windows-User Device Registration/Admin" `
+        -Source "Microsoft-Windows-User Device Registration" `
+        -EventId 4096 `
+        -RepetitionInterval (New-TimeSpan -Hours 1) `
+        -RepetitionDuration (New-TimeSpan -Days 1)
+
+    # Combine triggers
+    $triggers = @($logonTrigger, $eventTrigger)
+
+    # PRINCIPAL: run as SYSTEM
+    $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+    # BUILD & REGISTER
+    $taskDefinition = New-ScheduledTask -Action $action -Principal $principal -Trigger $triggers
+    Register-ScheduledTask -TaskPath $EntraTaskPath -TaskName $EntraTaskName -InputObject $taskDefinition | Out-Null
+
+    Write-Host "Created Entra ID join task [$EntraTaskPath\$EntraTaskName]."
 }
 
 ###############################################################################
-# Helper: Create the Intune enrollment task
+# HELPER: Create/Update Intune Enrollment Task
 ###############################################################################
-function New-IntuneEnrollmentTask {
-    $action = New-ScheduledTaskAction -Execute "C:\Windows\System32\deviceenroller.exe" -Argument "/c /AutoEnrollMDM"
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
-    Register-ScheduledTask -TaskPath $IntuneTaskPath -TaskName $IntuneTaskName -Action $action -Trigger $trigger -RunLevel Highest -Description "Automatically enrolls the device in Intune."
+function Ensure-IntuneMDMTask {
+    if (Test-ScheduledTask -TaskPath $IntuneTaskPath -TaskName $IntuneTaskName) {
+        Write-Host "Intune enrollment task [$IntuneTaskPath\$IntuneTaskName] already exists."
+        return
+    }
+
+    Write-Host "Creating Intune enrollment task [$IntuneTaskPath\$IntuneTaskName]..."
+
+    # ACTION
+    $action = New-ScheduledTaskAction -Execute $IntuneCommand -Argument $IntuneArguments
+
+    # TRIGGER: One time (a couple minutes from now), repeat every 5 mins for 1 day
+    $onceTrigger = New-ScheduledTaskTrigger -Once `
+        -At (Get-Date).AddMinutes(2) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5) `
+        -RepetitionDuration (New-TimeSpan -Days 1)
+
+    # PRINCIPAL: run as SYSTEM
+    $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+    # BUILD & REGISTER
+    $taskDefinition = New-ScheduledTask -Action $action -Principal $principal -Trigger $onceTrigger
+    Register-ScheduledTask -TaskPath $IntuneTaskPath -TaskName $IntuneTaskName -InputObject $taskDefinition | Out-Null
+
+    Write-Host "Created Intune enrollment task [$IntuneTaskPath\$IntuneTaskName]."
 }
 
 ###############################################################################
-# 1. Check/Create Entra ID Join Task
+# 1. Ensure both tasks
 ###############################################################################
-if (-not (Test-ScheduledTask -TaskPath $EntraTaskPath -TaskName $EntraTaskName)) {
-    Write-Host "Entra ID join task not found. Creating..."
-    New-EntraIDJoinTask
-} else {
-    Write-Host "Entra ID join task already exists."
-}
+Ensure-EntraIDJoinTask
+Ensure-IntuneMDMTask
 
 ###############################################################################
-# 2. Check/Create Intune Enrollment Task
+# 2. Run Entra ID Join Task & Verify
 ###############################################################################
-if (-not (Test-ScheduledTask -TaskPath $IntuneTaskPath -TaskName $IntuneTaskName)) {
-    Write-Host "Intune enrollment task not found. Creating..."
-    New-IntuneEnrollmentTask
-} else {
-    Write-Host "Intune enrollment task already exists."
-}
-
-###############################################################################
-# 3. Run and Verify Entra ID Join
-###############################################################################
-Write-Host "Running Entra ID join task..."
+Write-Host "Starting Entra ID join task: [$EntraTaskPath\$EntraTaskName]..."
 Start-ScheduledTask -TaskPath $EntraTaskPath -TaskName $EntraTaskName
 
-Write-Host "Waiting 60 seconds for Entra ID join to complete..."
+Write-Host "Waiting 60 seconds for Entra join to complete..."
 Start-Sleep -Seconds 60
 
 $dsregStatus = dsregcmd /status
 if ($dsregStatus -match "AzureAdJoined\s*:\s*YES") {
-    Write-Host "Device successfully joined to Entra ID."
+    Write-Host "Device successfully joined to Entra ID (Azure AD)."
 } else {
-    Write-Host "Entra ID join failed or not detected. Please check manually."
-    exit 1
+    Write-Warning "Entra ID join not confirmed. Check dsregcmd /status manually."
 }
 
 ###############################################################################
-# 4. Run and Verify Intune Enrollment
+# 3. Run Intune Enrollment Task & Verify
 ###############################################################################
-Write-Host "Running Intune enrollment task..."
+Write-Host "Starting Intune enrollment task: [$IntuneTaskPath\$IntuneTaskName]..."
 Start-ScheduledTask -TaskPath $IntuneTaskPath -TaskName $IntuneTaskName
 
 Write-Host "Waiting 60 seconds for Intune enrollment to complete..."
 Start-Sleep -Seconds 60
 
+# Check dsregcmd /status for MDM reference, e.g. "MDM : Microsoft Intune"
 $mdmStatus = dsregcmd /status
-# Note: "MDM: Microsoft Intune" is typical, but environment strings can vary
 if ($mdmStatus -match "MDM\s*:\s*Microsoft Intune") {
     Write-Host "Device successfully enrolled in Intune."
 } else {
-    Write-Host "Intune enrollment failed or not detected. Please check manually."
-    exit 2
+    Write-Warning "Intune enrollment not confirmed. Check dsregcmd /status manually."
 }
 
-###############################################################################
-# 5. Check for SCCM and advise user
-###############################################################################
-$SCCMClientPath = Join-Path $env:WinDir "CCM\ccmexec.exe"
-if (Test-Path $SCCMClientPath) {
-    Write-Warning "SCCM Client was found. Please run the SCCM Killer script to finalize Intune rollout."
-} else {
-    Write-Host "No SCCM client detected."
-}
+Write-Host "Script complete."
