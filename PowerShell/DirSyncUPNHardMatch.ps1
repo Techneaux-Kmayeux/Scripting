@@ -26,9 +26,9 @@
 #>
 
 param(
-    [string]$FailureCsvPath       = "$PSScriptRoot\Logs\DirSyncUPNHardMatch_Failure_$(Get-Date).ToString("yyyyMMdd_HHmmss").csv",
-    [string]$SuccessCsvPath       = "$PSScriptRoot\Logs\DirSyncUPNHardMatch_Success_$(Get-Date).ToString("yyyyMMdd_HHmmss").csv",
-    [string]$OrphanReportCsvPath  = "$PSScriptRoot\Logs\AzureNotInAD_$(Get-Date).ToString("yyyyMMdd_HHmmss").csv",
+    [string]$FailureCsvPath       = (Join-Path $PSScriptRoot "Logs\DirSyncUPNHardMatch_Failure_$((Get-Date).ToString("yyyyMMdd_HHmmss")).csv"),
+    [string]$SuccessCsvPath       = (Join-Path $PSScriptRoot "Logs\DirSyncUPNHardMatch_Success_$((Get-Date).ToString("yyyyMMdd_HHmmss")).csv"),
+    [string]$OrphanReportCsvPath  = (Join-Path $PSScriptRoot "Logs\AzureNotInAD_$((Get-Date).ToString("yyyyMMdd_HHmmss")).csv"),
 
     [int]$MaxUsers                = 20,
     [bool]$FullSend               = $false,
