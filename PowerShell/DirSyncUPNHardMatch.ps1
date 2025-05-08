@@ -94,7 +94,7 @@ if (-not $singleUserOverride) {
 # 2. Install Microsoft.Graph module if needed
 ###############################################################################
 try {
-    Install-Module Microsoft.Graph -ErrorAction Ignore -Scope CurrentUser
+    Install-Module Microsoft.Graph -ErrorAction Ignore -Scope AllUsers
 }
 catch {
     Write-Host "ERROR: Microsoft Graph Module Failed to Install. Troubleshoot manually then re-run script."
