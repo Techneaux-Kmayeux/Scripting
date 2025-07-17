@@ -187,6 +187,13 @@ def main():
         print(f"Error reading CSV from {input_csv}:\n{e}")
         sys.exit(1)
 
+    # Validate required columns exist to avoid KeyError later
+    required_cols = {"Name", "IP", "HostName"}
+    missing = required_cols.difference(df.columns)
+    if missing:
+        print(f"CSV missing expected column(s): {', '.join(sorted(missing))}")
+        sys.exit(1)
+
     # 4) Exclude any host that has "NinjaRMMAgent"
     #    4a) Find the (IP, HostName) combos with NinjaRMMAgent
     ninja_mask = df['Name'].str.contains("NinjaRMMAgent", na=False)
